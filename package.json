@@ -16,6 +16,7 @@
     "test:rls": "vitest run tests/rls.test.ts",
     "format": "prettier --write .",
     "migrate": "node -e \"console.log('Migrações SQL em supabase/migrations. Aplique com: supabase db push')\"",
+    "verify:supabase": "node scripts/verify-supabase.mjs",
     "migrate:videos": "node scripts/migrate-mux-to-google-drive.mjs"
   },
   "dependencies": {

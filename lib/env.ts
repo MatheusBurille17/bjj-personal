@@ -14,7 +14,11 @@ const envSchema = z.object({
     .default("dev-only-secret-change-me-in-production-please-1234567890"),
 
   NEXT_PUBLIC_SUPABASE_URL: z.string().url().optional(),
+  // A publishable key substitui a anon key nos projetos novos do Supabase.
+  NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: z.string().min(1).optional(),
   NEXT_PUBLIC_SUPABASE_ANON_KEY: z.string().min(1).optional(),
+  // Secret key (sb_secret_...) substitui a service_role key nos projetos novos.
+  SUPABASE_SECRET_KEY: z.string().min(1).optional(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1).optional(),
 
   RESEND_API_KEY: z.string().min(1).optional(),
@@ -89,9 +93,19 @@ export function getEnv(): Env {
   return cached;
 }
 
+export function getSupabasePublicKey(): string | undefined {
+  const env = getEnv();
+  return env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ?? env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+}
+
+export function getSupabaseSecretKey(): string | undefined {
+  const env = getEnv();
+  return env.SUPABASE_SECRET_KEY ?? env.SUPABASE_SERVICE_ROLE_KEY;
+}
+
 export function isSupabaseConfigured(): boolean {
   const env = getEnv();
-  return Boolean(env.NEXT_PUBLIC_SUPABASE_URL && env.NEXT_PUBLIC_SUPABASE_ANON_KEY);
+  return Boolean(env.NEXT_PUBLIC_SUPABASE_URL && getSupabasePublicKey());
 }
 
 export function isProduction(): boolean {
