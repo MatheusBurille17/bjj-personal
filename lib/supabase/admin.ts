@@ -1,4 +1,6 @@
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Database } from "./database";
 
 /** Chave secreta do servidor (sb_secret_... ou service_role legado). */
 export function getSupabaseSecretKey(): string | undefined {
@@ -6,17 +8,21 @@ export function getSupabaseSecretKey(): string | undefined {
 }
 
 /**
- * Cliente administrativo (secret/service role). Deve ser usado somente no
- * servidor e nunca exposto ao navegador. Operações administrativas devem
- * validar o professor/usuário antes de executar.
+ * Cliente administrativo (secret/service role). Ignora RLS: use somente em
+ * operações de servidor já autorizadas pela aplicação (webhooks, importação,
+ * criação de usuários por convite, auditoria).
  */
-export function createAdminClient() {
+export function createAdminClient(): SupabaseClient<Database> {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const secretKey = getSupabaseSecretKey();
   if (!url || !secretKey) {
     throw new Error("SUPABASE_SECRET_KEY não configurada");
   }
-  return createSupabaseClient(url, secretKey, {
+  return createSupabaseClient<Database>(url, secretKey, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
+}
+
+export function isAdminClientAvailable(): boolean {
+  return Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL && getSupabaseSecretKey());
 }

@@ -23,7 +23,7 @@ export const PATCH = route<{ id: string }>(async (request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
   const data = updateVideoSchema.parse(await parseJson(request));
-  const video = getVideo(id, session.user.id);
+  const video = await getVideo(id, session.user.id);
 
   if (video.provider === "google_drive") {
     try {
@@ -40,13 +40,13 @@ export const PATCH = route<{ id: string }>(async (request, context) => {
     }
   }
 
-  return jsonSuccess(updateVideo(id, session.user.id, data));
+  return jsonSuccess(await updateVideo(id, session.user.id, data));
 });
 
 export const DELETE = route<{ id: string }>(async (request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
-  const video = getVideo(id, session.user.id);
+  const video = await getVideo(id, session.user.id);
   const hard = new URL(request.url).searchParams.get("hard") === "true";
 
   if (video.provider === "google_drive") {
@@ -63,6 +63,6 @@ export const DELETE = route<{ id: string }>(async (request, context) => {
     );
   }
 
-  deleteVideo(id, session.user.id);
+  await deleteVideo(id, session.user.id);
   return jsonDeleted("Vídeo removido");
 });

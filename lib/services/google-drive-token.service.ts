@@ -124,7 +124,7 @@ export async function storeDriveTokens(
   const timestamp = nowIso();
   const expiresAt = expiryFromNow(input.expiresIn);
 
-  return mutate((db) => {
+  const stored = mutate((db) => {
     const existing = db.providers_oauth_tokens.find(
       (record) => record.user_id === userId,
     );
@@ -165,15 +165,115 @@ export async function storeDriveTokens(
     db.providers_oauth_tokens.push(record);
     return record;
   });
+
+  // Espelha no login social para que as duas telas representem a mesma conexão.
+  mutate((db) => {
+    const social = db.user_google_oauth.find(
+      (record) => record.user_id === userId,
+    );
+    if (!social) return;
+    social.encrypted_access_token = stored.encrypted_access_token;
+    social.encrypted_refresh_token = stored.encrypted_refresh_token;
+    social.token_iv = stored.token_iv;
+    social.token_expiry_at = stored.expires_at;
+    social.is_connected = true;
+    social.scopes_granted = input.scope.split(/\s+/).filter(Boolean);
+    social.consent_timestamp = timestamp;
+    social.updated_at = timestamp;
+  });
+
+  return stored;
 }
 
+/**
+ * Fonte única de tokens do Google.
+ *
+ * Usuários que já conectaram o Google pelo login social (user_google_oauth)
+ * são adotados automaticamente, sem exigir um segundo consentimento.
+ */
 export function getDriveTokenRecord(
   userId: string,
 ): DriveOAuthTokenRecord | null {
-  return (
-    getDb().providers_oauth_tokens.find((record) => record.user_id === userId) ??
-    null
+  const db = getDb();
+  const existing = db.providers_oauth_tokens.find(
+    (record) => record.user_id === userId,
   );
+  if (existing) return existing;
+
+  const social = db.user_google_oauth.find(
+    (record) => record.user_id === userId,
+  );
+  if (!social?.is_connected || !social.encrypted_access_token) return null;
+
+  const adopted: DriveOAuthTokenRecord = {
+    id: randomUUID(),
+    user_id: userId,
+    provider: "google_drive",
+    encrypted_access_token: social.encrypted_access_token,
+    encrypted_refresh_token: social.encrypted_refresh_token,
+    token_iv: social.token_iv,
+    expires_at: social.token_expiry_at,
+    scope: social.scopes_granted.join(" "),
+    drive_id: social.email,
+    google_email: social.email,
+    created_at: social.created_at,
+    updated_at: nowIso(),
+  };
+
+  return mutate((database) => {
+    database.providers_oauth_tokens.push(adopted);
+    return adopted;
+  });
+}
+
+/** Remove o registro de tokens do Drive (usado ao desconectar o Google). */
+export function clearDriveTokenRecord(userId: string): void {
+  mutate((db) => {
+    db.providers_oauth_tokens = db.providers_oauth_tokens.filter(
+      (record) => record.user_id !== userId,
+    );
+  });
+}
+
+/** Mantém o access token do Drive sincronizado quando o login social renova. */
+export function syncDriveAccessToken(
+  userId: string,
+  encryptedAccessToken: string,
+  accessIv: string,
+  expiresAt: string,
+): void {
+  mutate((db) => {
+    const record = db.providers_oauth_tokens.find(
+      (item) => item.user_id === userId,
+    );
+    if (!record) return;
+    const refreshIv = (record.token_iv ?? "").split(":")[1] ?? "";
+    record.encrypted_access_token = encryptedAccessToken;
+    record.token_iv = `${accessIv}:${refreshIv}`;
+    record.expires_at = expiresAt;
+    record.updated_at = nowIso();
+  });
+}
+
+/** Mantém o login social sincronizado quando o token do Drive é renovado. */
+export function syncSocialAccessTokenFromDrive(
+  userId: string,
+  encryptedAccessToken: string,
+  accessIv: string,
+  expiresAt: string,
+): void {
+  mutate((db) => {
+    const social = db.user_google_oauth.find(
+      (record) => record.user_id === userId,
+    );
+    if (!social || !social.is_connected) return;
+    const refreshIv = (social.token_iv ?? "").split(":")[1] ?? "";
+    social.encrypted_access_token = encryptedAccessToken;
+    social.token_iv = `${accessIv}:${refreshIv}`;
+    social.token_expiry_at = expiresAt;
+    social.last_token_refresh_at = nowIso();
+    social.updated_at = nowIso();
+  });
 }
 
 export function shouldRefreshDriveToken(expiresAt: string, now = Date.now()): boolean {
@@ -202,6 +302,16 @@ function clearDriveTokens(userId: string): void {
     db.providers_oauth_tokens = db.providers_oauth_tokens.filter(
       (record) => record.user_id !== userId,
     );
+    const social = db.user_google_oauth.find(
+      (record) => record.user_id === userId,
+    );
+    if (social) {
+      social.encrypted_access_token = "";
+      social.encrypted_refresh_token = "";
+      social.token_iv = "";
+      social.is_connected = false;
+      social.updated_at = nowIso();
+    }
   });
 }
 
@@ -262,6 +372,12 @@ export async function getValidDriveAccessToken(userId: string): Promise<string> 
       current.expires_at = expiresAt;
       current.updated_at = nowIso();
     });
+    syncSocialAccessTokenFromDrive(
+      userId,
+      encrypted.encrypted,
+      encrypted.iv,
+      expiresAt,
+    );
     return refreshed.access_token;
   } catch (error) {
     if (
@@ -293,6 +409,20 @@ export async function getDriveConnectionStatus(
   userId: string,
   options: { includeStorage?: boolean } = {},
 ): Promise<DriveConnectionStatus> {
+  // O armazenamento de vídeos no Drive ainda não foi migrado para o Supabase.
+  // Enquanto isso, não exibimos o estado antigo do repositório local.
+  if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+    return {
+      connected: false,
+      userEmail: null,
+      driveId: null,
+      expiresAt: null,
+      lastSync: null,
+      scope: null,
+      storage: null,
+    };
+  }
+
   const record = getDriveTokenRecord(userId);
   const config = getDb().video_storage_config.find(
     (item) => item.user_id === userId,

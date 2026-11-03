@@ -15,7 +15,7 @@ export const dynamic = "force-dynamic";
 export default async function StudentPlanPage() {
   const session = await getCurrentSession();
   if (!session) redirect("/login");
-  const plans = getStudentTrainingPlans(session.user.id);
+  const plans = await getStudentTrainingPlans(session.user.id);
 
   return (
     <div>

@@ -21,12 +21,12 @@ export const GET = route(async (request) => {
     page: searchParams.get("page") ?? undefined,
     pageSize: searchParams.get("pageSize") ?? undefined,
   });
-  const result = getPlans(session.user.id, query);
+  const result = await getPlans(session.user.id, query);
   return jsonSuccess(result.plans, { pagination: result.pagination });
 });
 
 export const POST = route(async (request) => {
   const session = await requireApiTeacher();
   const data = createPlanSchema.parse(await parseJson(request));
-  return jsonCreated(createPlan(session.user.id, data));
+  return jsonCreated(await createPlan(session.user.id, data));
 });

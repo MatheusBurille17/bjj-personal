@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type {
   Module,
   ModuleWithCounts,
@@ -17,471 +16,751 @@ import type {
   UpdateTechniqueInput,
   UpdateVideoInput,
 } from "@/lib/validation/library";
-import { getDb, mutate, nowIso } from "@/lib/db/store";
-import { ApiError, buildPagination, paginate } from "@/lib/middleware/errors";
+import { ApiError, buildPagination } from "@/lib/middleware/errors";
 import { DEMO_VIDEO_URL } from "@/lib/db/seed";
 import { buildSignedPlaybackUrl } from "@/lib/mux/playback";
 import { isMuxConfigured } from "@/lib/mux/client";
+import { createClient } from "@/lib/supabase/server";
+import { createAdminClient, isAdminClientAvailable } from "@/lib/supabase/admin";
+import { mapPostgrestError, unwrapMaybe, unwrapVoid } from "@/lib/supabase/errors";
 
-function ownedTechnique(techniqueId: string, teacherId: string): Technique {
-  const technique = getDb().techniques.find((item) => item.id === techniqueId);
+function nextSortOrder(items: Array<{ sort_order: number }>): number {
+  return items.reduce((max, item) => Math.max(max, item.sort_order), 0) + 1;
+}
+
+function countBy<T>(items: T[], key: (item: T) => string): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    const id = key(item);
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  return counts;
+}
+
+async function ownedTechnique(techniqueId: string, teacherId: string): Promise<Technique> {
+  const supabase = await createClient();
+  const technique = unwrapMaybe(
+    await supabase.from("techniques").select("*").eq("id", techniqueId).maybeSingle(),
+  );
   if (!technique) throw ApiError.notFound("Técnica não encontrada");
   if (technique.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
   return technique;
 }
 
-function ownedModule(moduleId: string, teacherId: string): Module {
-  const moduleRecord = getDb().modules.find((item) => item.id === moduleId);
+async function ownedModule(moduleId: string, teacherId: string): Promise<Module> {
+  const supabase = await createClient();
+  const moduleRecord = unwrapMaybe(
+    await supabase.from("modules").select("*").eq("id", moduleId).maybeSingle(),
+  );
   if (!moduleRecord) throw ApiError.notFound("Módulo não encontrado");
   if (moduleRecord.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
   return moduleRecord;
 }
 
-function ownedVideo(videoId: string, teacherId: string): Video {
-  const video = getDb().videos.find((item) => item.id === videoId);
+async function ownedVideo(videoId: string, teacherId: string): Promise<Video> {
+  const supabase = await createClient();
+  const video = unwrapMaybe(
+    await supabase.from("videos").select("*").eq("id", videoId).maybeSingle(),
+  );
   if (!video) throw ApiError.notFound("Vídeo não encontrado");
   if (video.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
   return video;
-}
-
-function nextSortOrder(items: Array<{ sort_order: number }>): number {
-  return items.reduce((max, item) => Math.max(max, item.sort_order), 0) + 1;
 }
 
 /* -------------------------------------------------------------------------- */
 /* Técnicas                                                                    */
 /* -------------------------------------------------------------------------- */
 
-export function getTechniques(
+export async function getTechniques(
   teacherId: string,
   options: { includeArchived?: boolean; page?: number; pageSize?: number } = {},
-): { techniques: TechniqueWithCounts[]; pagination: ReturnType<typeof buildPagination> } {
-  const db = getDb();
-  const page = options.page ?? 1;
-  const pageSize = options.pageSize ?? 20;
+): Promise<{
+  techniques: TechniqueWithCounts[];
+  pagination: ReturnType<typeof buildPagination>;
+}> {
+  const supabase = await createClient();
+  const page = Math.max(1, options.page ?? 1);
+  const pageSize = Math.min(Math.max(1, options.pageSize ?? 20), 100);
+  const from = (page - 1) * pageSize;
 
-  let techniques = db.techniques.filter((item) => item.teacher_id === teacherId);
-  if (!options.includeArchived) {
-    techniques = techniques.filter((item) => item.status === "active");
+  let query = supabase
+    .from("techniques")
+    .select("*", { count: "exact" })
+    .eq("teacher_id", teacherId)
+    .order("sort_order", { ascending: true })
+    .range(from, from + pageSize - 1);
+
+  if (!options.includeArchived) query = query.eq("status", "active");
+
+  const { data: techniques, error, count } = await query;
+  if (error) throw mapPostgrestError(error);
+
+  const rows = techniques ?? [];
+  const ids = rows.map((item) => item.id);
+
+  let modules: Array<{ technique_id: string }> = [];
+  let videos: Array<{ technique_id: string }> = [];
+  if (ids.length > 0) {
+    const [moduleResult, videoResult] = await Promise.all([
+      supabase.from("modules").select("technique_id").in("technique_id", ids),
+      supabase.from("videos").select("technique_id").in("technique_id", ids),
+    ]);
+    if (moduleResult.error) throw mapPostgrestError(moduleResult.error);
+    if (videoResult.error) throw mapPostgrestError(videoResult.error);
+    modules = moduleResult.data ?? [];
+    videos = videoResult.data ?? [];
   }
-  techniques = techniques.sort((a, b) => a.sort_order - b.sort_order);
 
-  const withCounts: TechniqueWithCounts[] = techniques.map((technique) => {
-    const modules = db.modules.filter((item) => item.technique_id === technique.id);
-    const videos = db.videos.filter((video) => video.technique_id === technique.id);
-    return {
-      ...technique,
-      module_count: modules.length,
-      video_count: videos.length,
-    };
-  });
+  const moduleCounts = countBy(modules, (item) => item.technique_id);
+  const videoCounts = countBy(videos, (item) => item.technique_id);
 
   return {
-    techniques: paginate(withCounts, page, pageSize),
-    pagination: buildPagination(withCounts.length, page, pageSize),
+    techniques: rows.map((technique) => ({
+      ...technique,
+      module_count: moduleCounts.get(technique.id) ?? 0,
+      video_count: videoCounts.get(technique.id) ?? 0,
+    })),
+    pagination: buildPagination(count ?? 0, page, pageSize),
   };
 }
 
-export function getLibraryTree(
+export async function getLibraryTree(
   teacherId: string,
   includeArchived = false,
-): {
+): Promise<{
   techniques: TechniqueWithCounts[];
   modules: Record<string, ModuleWithCounts[]>;
   videos: Record<string, Video[]>;
-} {
-  const all = getTechniques(teacherId, { pageSize: 100, includeArchived }).techniques;
-  const modules: Record<string, ModuleWithCounts[]> = {};
-  const videos: Record<string, Video[]> = {};
+}> {
+  const supabase = await createClient();
 
-  for (const technique of all) {
-    const techniqueModules = getModules(technique.id, teacherId, includeArchived);
-    modules[technique.id] = techniqueModules;
-    for (const moduleRecord of techniqueModules) {
-      videos[moduleRecord.id] = getVideos(moduleRecord.id, teacherId, includeArchived);
-    }
+  let techniqueQuery = supabase
+    .from("techniques")
+    .select("*")
+    .eq("teacher_id", teacherId)
+    .order("sort_order", { ascending: true });
+  if (!includeArchived) techniqueQuery = techniqueQuery.eq("status", "active");
+
+  const [techniqueResult, moduleResult, videoResult] = await Promise.all([
+    techniqueQuery,
+    supabase
+      .from("modules")
+      .select("*")
+      .eq("teacher_id", teacherId)
+      .order("sort_order", { ascending: true }),
+    supabase
+      .from("videos")
+      .select("*")
+      .eq("teacher_id", teacherId)
+      .order("created_at", { ascending: true }),
+  ]);
+
+  if (techniqueResult.error) throw mapPostgrestError(techniqueResult.error);
+  if (moduleResult.error) throw mapPostgrestError(moduleResult.error);
+  if (videoResult.error) throw mapPostgrestError(videoResult.error);
+
+  const allModules = (moduleResult.data ?? []).filter(
+    (item) => includeArchived || item.status === "active",
+  );
+  const allVideos = (videoResult.data ?? []).filter(
+    (item) => includeArchived || item.status !== "archived",
+  );
+
+  const moduleVideoCounts = countBy(allVideos, (item) => item.module_id);
+  const techniqueVideoCounts = countBy(allVideos, (item) => item.technique_id);
+  const techniqueModuleCounts = countBy(allModules, (item) => item.technique_id);
+
+  const videos: Record<string, Video[]> = {};
+  for (const moduleRecord of allModules) {
+    videos[moduleRecord.id] = allVideos.filter((item) => item.module_id === moduleRecord.id);
   }
 
-  return { techniques: all, modules, videos };
+  const modules: Record<string, ModuleWithCounts[]> = {};
+  for (const moduleRecord of allModules) {
+    const list = modules[moduleRecord.technique_id] ?? [];
+    list.push({
+      ...moduleRecord,
+      video_count: moduleVideoCounts.get(moduleRecord.id) ?? 0,
+    });
+    modules[moduleRecord.technique_id] = list;
+  }
+
+  const techniques: TechniqueWithCounts[] = (techniqueResult.data ?? []).map(
+    (technique) => ({
+      ...technique,
+      module_count: techniqueModuleCounts.get(technique.id) ?? 0,
+      video_count: techniqueVideoCounts.get(technique.id) ?? 0,
+    }),
+  );
+
+  return { techniques, modules, videos };
 }
 
-export function createTechnique(teacherId: string, data: CreateTechniqueInput): Technique {
-  const db = getDb();
-  const timestamp = nowIso();
-  const technique: Technique = {
-    id: randomUUID(),
-    teacher_id: teacherId,
-    name: data.name,
-    description: data.description ?? null,
-    category: data.category ?? null,
-    sort_order:
-      data.sort_order ??
-      nextSortOrder(db.techniques.filter((item) => item.teacher_id === teacherId)),
-    status: "active",
-    created_at: timestamp,
-    updated_at: timestamp,
-  };
+export async function createTechnique(
+  teacherId: string,
+  data: CreateTechniqueInput,
+): Promise<Technique> {
+  const supabase = await createClient();
+  let sortOrder = data.sort_order;
+  if (sortOrder === undefined) {
+    const last = await supabase
+      .from("techniques")
+      .select("sort_order")
+      .eq("teacher_id", teacherId)
+      .order("sort_order", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    sortOrder = nextSortOrder(last.data ? [last.data] : []);
+  }
 
-  mutate((database) => {
-    database.techniques.push(technique);
-  });
-  return technique;
+  const { data: created, error } = await supabase
+    .from("techniques")
+    .insert({
+      teacher_id: teacherId,
+      name: data.name,
+      description: data.description ?? null,
+      category: data.category ?? null,
+      sort_order: sortOrder,
+      status: "active",
+    })
+    .select("*")
+    .single();
+
+  if (error) throw mapPostgrestError(error);
+  return created;
 }
 
-export function updateTechnique(
+export async function updateTechnique(
   techniqueId: string,
   teacherId: string,
   data: UpdateTechniqueInput,
-): Technique {
-  ownedTechnique(techniqueId, teacherId);
-  return mutate((db) => {
-    const technique = db.techniques.find((item) => item.id === techniqueId);
-    if (!technique) throw ApiError.notFound("Técnica não encontrada");
-    if (data.name !== undefined) technique.name = data.name;
-    if (data.description !== undefined) technique.description = data.description;
-    if (data.category !== undefined) technique.category = data.category;
-    if (data.sort_order !== undefined) technique.sort_order = data.sort_order;
-    technique.updated_at = nowIso();
-    return { ...technique };
-  });
+): Promise<Technique> {
+  await ownedTechnique(techniqueId, teacherId);
+  const supabase = await createClient();
+
+  const payload: {
+    name?: string;
+    description?: string | null;
+    category?: string | null;
+    sort_order?: number;
+  } = {};
+  if (data.name !== undefined) payload.name = data.name;
+  if (data.description !== undefined) payload.description = data.description;
+  if (data.category !== undefined) payload.category = data.category;
+  if (data.sort_order !== undefined) payload.sort_order = data.sort_order;
+
+  const { data: updated, error } = await supabase
+    .from("techniques")
+    .update(payload)
+    .eq("id", techniqueId)
+    .select("*")
+    .single();
+
+  if (error) throw mapPostgrestError(error);
+  return updated;
 }
 
-export function reorderTechniques(
+export async function reorderTechniques(
   teacherId: string,
   items: Array<{ id: string; sort_order: number }>,
-): void {
-  for (const item of items) ownedTechnique(item.id, teacherId);
-  mutate((db) => {
-    for (const item of items) {
-      const technique = db.techniques.find((record) => record.id === item.id);
-      if (technique) {
-        technique.sort_order = item.sort_order;
-        technique.updated_at = nowIso();
-      }
-    }
-  });
+): Promise<void> {
+  const supabase = await createClient();
+  await Promise.all(items.map((item) => ownedTechnique(item.id, teacherId)));
+  await Promise.all(
+    items.map(async (item) => {
+      const result = await supabase
+        .from("techniques")
+        .update({ sort_order: item.sort_order })
+        .eq("id", item.id);
+      unwrapVoid(result);
+    }),
+  );
 }
 
-/** Arquiva a técnica e cascateia para módulos e vídeos (Requisito 5). */
-export function archiveTechnique(techniqueId: string, teacherId: string): Technique {
-  ownedTechnique(techniqueId, teacherId);
-  return mutate((db) => {
-    const technique = db.techniques.find((item) => item.id === techniqueId);
-    if (!technique) throw ApiError.notFound("Técnica não encontrada");
-    const timestamp = nowIso();
-    technique.status = "archived";
-    technique.updated_at = timestamp;
+/** Arquiva a técnica e cascateia para módulos e vídeos. */
+export async function archiveTechnique(
+  techniqueId: string,
+  teacherId: string,
+): Promise<Technique> {
+  await ownedTechnique(techniqueId, teacherId);
+  const supabase = await createClient();
 
-    const moduleIds = db.modules
-      .filter((item) => item.technique_id === techniqueId)
-      .map((item) => item.id);
-    for (const moduleRecord of db.modules.filter((item) => item.technique_id === techniqueId)) {
-      moduleRecord.status = "archived";
-      moduleRecord.updated_at = timestamp;
-    }
-    for (const video of db.videos.filter((item) => moduleIds.includes(item.module_id))) {
-      video.status = "archived";
-      video.updated_at = timestamp;
-    }
-    return { ...technique };
-  });
+  const [technique, modules, videos] = await Promise.all([
+    supabase
+      .from("techniques")
+      .update({ status: "archived" })
+      .eq("id", techniqueId)
+      .select("*")
+      .single(),
+    supabase
+      .from("modules")
+      .update({ status: "archived" })
+      .eq("technique_id", techniqueId),
+    supabase
+      .from("videos")
+      .update({ status: "archived" })
+      .eq("technique_id", techniqueId),
+  ]);
+
+  if (technique.error) throw mapPostgrestError(technique.error);
+  unwrapVoid(modules);
+  unwrapVoid(videos);
+  return technique.data;
 }
 
-/** Reativa apenas a técnica; filhos permanecem arquivados (Requisito 6). */
-export function unarchiveTechnique(techniqueId: string, teacherId: string): Technique {
-  const technique = ownedTechnique(techniqueId, teacherId);
+/** Reativa apenas a técnica; filhos permanecem arquivados. */
+export async function unarchiveTechnique(
+  techniqueId: string,
+  teacherId: string,
+): Promise<Technique> {
+  const technique = await ownedTechnique(techniqueId, teacherId);
   if (technique.status === "active") {
     throw ApiError.conflict("Esta técnica já está ativa");
   }
-  return mutate((db) => {
-    const record = db.techniques.find((item) => item.id === techniqueId);
-    if (!record) throw ApiError.notFound("Técnica não encontrada");
-    record.status = "active";
-    record.updated_at = nowIso();
-    return { ...record };
-  });
+
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("techniques")
+    .update({ status: "active" })
+    .eq("id", techniqueId)
+    .select("*")
+    .single();
+
+  if (error) throw mapPostgrestError(error);
+  return data;
 }
 
 /* -------------------------------------------------------------------------- */
 /* Módulos                                                                     */
 /* -------------------------------------------------------------------------- */
 
-export function getModules(
+export async function getModules(
   techniqueId: string,
   teacherId: string,
   includeArchived = false,
-): ModuleWithCounts[] {
-  ownedTechnique(techniqueId, teacherId);
-  const db = getDb();
-  let modules = db.modules.filter((item) => item.technique_id === techniqueId);
-  if (!includeArchived) modules = modules.filter((item) => item.status === "active");
-  return modules
-    .sort((a, b) => a.sort_order - b.sort_order)
-    .map((moduleRecord) => ({
-      ...moduleRecord,
-      video_count: db.videos.filter((video) => video.module_id === moduleRecord.id).length,
-    }));
+): Promise<ModuleWithCounts[]> {
+  await ownedTechnique(techniqueId, teacherId);
+  const supabase = await createClient();
+
+  let query = supabase
+    .from("modules")
+    .select("*")
+    .eq("technique_id", techniqueId)
+    .order("sort_order", { ascending: true });
+  if (!includeArchived) query = query.eq("status", "active");
+
+  const { data, error } = await query;
+  if (error) throw mapPostgrestError(error);
+
+  const modules = data ?? [];
+  if (modules.length === 0) return [];
+
+  const videoResult = await supabase
+    .from("videos")
+    .select("module_id")
+    .in("module_id", modules.map((item) => item.id));
+  if (videoResult.error) throw mapPostgrestError(videoResult.error);
+
+  const counts = countBy(videoResult.data ?? [], (item) => item.module_id);
+  return modules.map((moduleRecord) => ({
+    ...moduleRecord,
+    video_count: counts.get(moduleRecord.id) ?? 0,
+  }));
 }
 
-export function createModule(teacherId: string, data: CreateModuleInput): Module {
-  const technique = ownedTechnique(data.technique_id, teacherId);
+export async function createModule(
+  teacherId: string,
+  data: CreateModuleInput,
+): Promise<Module> {
+  const technique = await ownedTechnique(data.technique_id, teacherId);
   if (technique.status === "archived") {
     throw ApiError.conflict("Não é possível adicionar módulos a uma técnica arquivada");
   }
-  const db = getDb();
-  const timestamp = nowIso();
-  const moduleRecord: Module = {
-    id: randomUUID(),
-    technique_id: data.technique_id,
-    teacher_id: teacherId,
-    name: data.name,
-    description: data.description ?? null,
-    sort_order:
-      data.sort_order ??
-      nextSortOrder(db.modules.filter((item) => item.technique_id === data.technique_id)),
-    status: "active",
-    created_at: timestamp,
-    updated_at: timestamp,
-  };
 
-  mutate((database) => {
-    database.modules.push(moduleRecord);
-  });
-  return moduleRecord;
+  const supabase = await createClient();
+  let sortOrder = data.sort_order;
+  if (sortOrder === undefined) {
+    const last = await supabase
+      .from("modules")
+      .select("sort_order")
+      .eq("technique_id", data.technique_id)
+      .order("sort_order", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    sortOrder = nextSortOrder(last.data ? [last.data] : []);
+  }
+
+  const { data: created, error } = await supabase
+    .from("modules")
+    .insert({
+      technique_id: data.technique_id,
+      teacher_id: teacherId,
+      name: data.name,
+      description: data.description ?? null,
+      sort_order: sortOrder,
+      status: "active",
+    })
+    .select("*")
+    .single();
+
+  if (error) throw mapPostgrestError(error);
+  return created;
 }
 
-export function updateModule(
+export async function updateModule(
   moduleId: string,
   teacherId: string,
   data: UpdateModuleInput,
-): Module {
-  ownedModule(moduleId, teacherId);
-  return mutate((db) => {
-    const moduleRecord = db.modules.find((item) => item.id === moduleId);
-    if (!moduleRecord) throw ApiError.notFound("Módulo não encontrado");
-    if (data.name !== undefined) moduleRecord.name = data.name;
-    if (data.description !== undefined) moduleRecord.description = data.description;
-    if (data.sort_order !== undefined) moduleRecord.sort_order = data.sort_order;
-    moduleRecord.updated_at = nowIso();
-    return { ...moduleRecord };
-  });
+): Promise<Module> {
+  await ownedModule(moduleId, teacherId);
+  const supabase = await createClient();
+
+  const payload: {
+    name?: string;
+    description?: string | null;
+    sort_order?: number;
+  } = {};
+  if (data.name !== undefined) payload.name = data.name;
+  if (data.description !== undefined) payload.description = data.description;
+  if (data.sort_order !== undefined) payload.sort_order = data.sort_order;
+
+  const { data: updated, error } = await supabase
+    .from("modules")
+    .update(payload)
+    .eq("id", moduleId)
+    .select("*")
+    .single();
+
+  if (error) throw mapPostgrestError(error);
+  return updated;
 }
 
-export function reorderModules(
+export async function reorderModules(
   teacherId: string,
   items: Array<{ id: string; sort_order: number }>,
-): void {
-  for (const item of items) ownedModule(item.id, teacherId);
-  mutate((db) => {
-    for (const item of items) {
-      const moduleRecord = db.modules.find((record) => record.id === item.id);
-      if (moduleRecord) {
-        moduleRecord.sort_order = item.sort_order;
-        moduleRecord.updated_at = nowIso();
-      }
-    }
-  });
+): Promise<void> {
+  const supabase = await createClient();
+  await Promise.all(items.map((item) => ownedModule(item.id, teacherId)));
+  await Promise.all(
+    items.map(async (item) => {
+      const result = await supabase
+        .from("modules")
+        .update({ sort_order: item.sort_order })
+        .eq("id", item.id);
+      unwrapVoid(result);
+    }),
+  );
 }
 
-export function moveModule(moduleId: string, teacherId: string, techniqueId: string): Module {
-  ownedModule(moduleId, teacherId);
-  const target = ownedTechnique(techniqueId, teacherId);
+export async function moveModule(
+  moduleId: string,
+  teacherId: string,
+  techniqueId: string,
+): Promise<Module> {
+  await ownedModule(moduleId, teacherId);
+  const target = await ownedTechnique(techniqueId, teacherId);
   if (target.status === "archived") {
     throw ApiError.conflict("Não é possível mover módulos para uma técnica arquivada");
   }
-  return mutate((db) => {
-    const moduleRecord = db.modules.find((item) => item.id === moduleId);
-    if (!moduleRecord) throw ApiError.notFound("Módulo não encontrado");
-    moduleRecord.technique_id = techniqueId;
-    moduleRecord.updated_at = nowIso();
-    return { ...moduleRecord };
-  });
+
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("modules")
+    .update({ technique_id: techniqueId })
+    .eq("id", moduleId)
+    .select("*")
+    .single();
+
+  if (error) throw mapPostgrestError(error);
+  return data;
 }
 
-/** Arquiva o módulo e seus vídeos (Requisito 11). */
-export function archiveModule(moduleId: string, teacherId: string): Module {
-  ownedModule(moduleId, teacherId);
-  return mutate((db) => {
-    const moduleRecord = db.modules.find((item) => item.id === moduleId);
-    if (!moduleRecord) throw ApiError.notFound("Módulo não encontrado");
-    const timestamp = nowIso();
-    moduleRecord.status = "archived";
-    moduleRecord.updated_at = timestamp;
-    for (const video of db.videos.filter((item) => item.module_id === moduleId)) {
-      video.status = "archived";
-      video.updated_at = timestamp;
-    }
-    return { ...moduleRecord };
-  });
+/** Arquiva o módulo e seus vídeos. */
+export async function archiveModule(
+  moduleId: string,
+  teacherId: string,
+): Promise<Module> {
+  await ownedModule(moduleId, teacherId);
+  const supabase = await createClient();
+
+  const [moduleResult, videoResult] = await Promise.all([
+    supabase
+      .from("modules")
+      .update({ status: "archived" })
+      .eq("id", moduleId)
+      .select("*")
+      .single(),
+    supabase.from("videos").update({ status: "archived" }).eq("module_id", moduleId),
+  ]);
+
+  if (moduleResult.error) throw mapPostgrestError(moduleResult.error);
+  unwrapVoid(videoResult);
+  return moduleResult.data;
 }
 
 /* -------------------------------------------------------------------------- */
 /* Vídeos                                                                      */
 /* -------------------------------------------------------------------------- */
 
-export function getVideos(
+export async function getVideos(
   moduleId: string,
   teacherId: string,
   includeArchived = false,
-): Video[] {
-  ownedModule(moduleId, teacherId);
-  return getDb()
-    .videos.filter((item) => item.module_id === moduleId)
-    .filter((item) => includeArchived || item.status !== "archived")
-    .sort((a, b) => a.created_at.localeCompare(b.created_at));
+): Promise<Video[]> {
+  await ownedModule(moduleId, teacherId);
+  const supabase = await createClient();
+
+  let query = supabase
+    .from("videos")
+    .select("*")
+    .eq("module_id", moduleId)
+    .order("created_at", { ascending: true });
+  if (!includeArchived) query = query.neq("status", "archived");
+
+  const { data, error } = await query;
+  if (error) throw mapPostgrestError(error);
+  return data ?? [];
 }
 
-export function createVideo(teacherId: string, data: CreateVideoInput): Video {
-  const moduleRecord = ownedModule(data.module_id, teacherId);
+export async function createVideo(
+  teacherId: string,
+  data: CreateVideoInput,
+): Promise<Video> {
+  const moduleRecord = await ownedModule(data.module_id, teacherId);
   if (moduleRecord.status === "archived") {
     throw ApiError.conflict("Não é possível adicionar vídeos a um módulo arquivado");
   }
 
-  const timestamp = nowIso();
   const status: VideoStatus = data.status ?? "uploading";
-  const video: Video = {
-    id: randomUUID(),
-    teacher_id: teacherId,
-    module_id: data.module_id,
-    technique_id: moduleRecord.technique_id,
-    title: data.title,
-    description: data.description ?? null,
-    provider: isMuxConfigured() ? "mux" : "demo",
-    provider_video_id: data.provider_video_id ?? `demo-${randomUUID()}`,
-    thumbnail_url: data.thumbnail_url ?? null,
-    playback_url:
-      data.playback_url ?? (status === "ready" ? DEMO_VIDEO_URL : null),
-    duration_seconds: data.duration_seconds ?? null,
-    status,
-    created_at: timestamp,
-    updated_at: timestamp,
-  };
+  const supabase = await createClient();
+  const { data: created, error } = await supabase
+    .from("videos")
+    .insert({
+      teacher_id: teacherId,
+      module_id: data.module_id,
+      technique_id: moduleRecord.technique_id,
+      title: data.title,
+      description: data.description ?? null,
+      provider: isMuxConfigured() ? "mux" : "demo",
+      provider_video_id: data.provider_video_id ?? `demo-${crypto.randomUUID()}`,
+      thumbnail_url: data.thumbnail_url ?? null,
+      playback_url: data.playback_url ?? (status === "ready" ? DEMO_VIDEO_URL : null),
+      duration_seconds: data.duration_seconds ?? null,
+      status,
+      owner_id: teacherId,
+      owner_role: "teacher",
+      visibility: "library",
+    })
+    .select("*")
+    .single();
 
-  mutate((db) => {
-    db.videos.push(video);
-  });
-  return video;
+  if (error) throw mapPostgrestError(error);
+  return created;
 }
 
-export function updateVideo(
+export async function updateVideo(
   videoId: string,
   teacherId: string,
   data: UpdateVideoInput,
-): Video {
-  ownedVideo(videoId, teacherId);
-  return mutate((db) => {
-    const video = db.videos.find((item) => item.id === videoId);
-    if (!video) throw ApiError.notFound("Vídeo não encontrado");
-    if (data.title !== undefined) video.title = data.title;
-    if (data.description !== undefined) video.description = data.description;
-    if (data.thumbnail_url !== undefined) video.thumbnail_url = data.thumbnail_url;
-    if (data.duration_seconds !== undefined) video.duration_seconds = data.duration_seconds;
-    video.updated_at = nowIso();
-    return { ...video };
-  });
+): Promise<Video> {
+  await ownedVideo(videoId, teacherId);
+  const supabase = await createClient();
+
+  const payload: {
+    title?: string;
+    description?: string | null;
+    thumbnail_url?: string | null;
+    duration_seconds?: number | null;
+  } = {};
+  if (data.title !== undefined) payload.title = data.title;
+  if (data.description !== undefined) payload.description = data.description;
+  if (data.thumbnail_url !== undefined) payload.thumbnail_url = data.thumbnail_url;
+  if (data.duration_seconds !== undefined) payload.duration_seconds = data.duration_seconds;
+
+  const { data: updated, error } = await supabase
+    .from("videos")
+    .update(payload)
+    .eq("id", videoId)
+    .select("*")
+    .single();
+
+  if (error) throw mapPostgrestError(error);
+  return updated;
 }
 
-export function getVideo(videoId: string, teacherId: string): Video {
-  return { ...ownedVideo(videoId, teacherId) };
+export async function getVideo(videoId: string, teacherId: string): Promise<Video> {
+  return ownedVideo(videoId, teacherId);
 }
 
-export function setVideoStatus(videoId: string, teacherId: string, status: VideoStatus): Video {
-  ownedVideo(videoId, teacherId);
-  return mutate((db) => {
-    const video = db.videos.find((item) => item.id === videoId);
-    if (!video) throw ApiError.notFound("Vídeo não encontrado");
-    video.status = status;
-    if (status === "ready" && !video.playback_url) video.playback_url = DEMO_VIDEO_URL;
-    video.updated_at = nowIso();
-    return { ...video };
-  });
+export async function setVideoStatus(
+  videoId: string,
+  teacherId: string,
+  status: VideoStatus,
+): Promise<Video> {
+  await ownedVideo(videoId, teacherId);
+  const supabase = await createClient();
+
+  const payload: { status: VideoStatus; playback_url?: string } = { status };
+  if (status === "ready") payload.playback_url = DEMO_VIDEO_URL;
+
+  const { data, error } = await supabase
+    .from("videos")
+    .update(payload)
+    .eq("id", videoId)
+    .select("*")
+    .single();
+
+  if (error) throw mapPostgrestError(error);
+  return data;
 }
 
-export function archiveVideo(videoId: string, teacherId: string): Video {
-  ownedVideo(videoId, teacherId);
-  return mutate((db) => {
-    const video = db.videos.find((item) => item.id === videoId);
-    if (!video) throw ApiError.notFound("Vídeo não encontrado");
-    video.status = "archived";
-    video.updated_at = nowIso();
-    return { ...video };
-  });
+export async function archiveVideo(videoId: string, teacherId: string): Promise<Video> {
+  await ownedVideo(videoId, teacherId);
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("videos")
+    .update({ status: "archived" })
+    .eq("id", videoId)
+    .select("*")
+    .single();
+
+  if (error) throw mapPostgrestError(error);
+  return data;
 }
 
-/** Impede exclusão quando há referências em planos ou aulas (Requisito 23). */
-export function deleteVideo(videoId: string, teacherId: string): void {
-  ownedVideo(videoId, teacherId);
-  const db = getDb();
-  const planReferences = db.plan_day_videos.some((item) => item.video_id === videoId);
-  const lessonReferences = db.lesson_videos.some((item) => item.video_id === videoId);
+/** Impede exclusão quando há referências em planos ou aulas. */
+export async function deleteVideo(videoId: string, teacherId: string): Promise<void> {
+  await ownedVideo(videoId, teacherId);
+  const supabase = await createClient();
 
-  if (planReferences || lessonReferences) {
+  const [planRefs, lessonRefs] = await Promise.all([
+    supabase
+      .from("plan_day_videos")
+      .select("id", { count: "exact", head: true })
+      .eq("video_id", videoId),
+    supabase
+      .from("lesson_videos")
+      .select("id", { count: "exact", head: true })
+      .eq("video_id", videoId),
+  ]);
+
+  if (planRefs.error) throw mapPostgrestError(planRefs.error);
+  if (lessonRefs.error) throw mapPostgrestError(lessonRefs.error);
+
+  if ((planRefs.count ?? 0) > 0 || (lessonRefs.count ?? 0) > 0) {
     throw ApiError.conflict(
       "Este vídeo está associado a planos ou aulas e não pode ser excluído. Arquive o vídeo para preservar o histórico.",
     );
   }
 
-  mutate((database) => {
-    database.videos = database.videos.filter((item) => item.id !== videoId);
-  });
+  unwrapVoid(await supabase.from("videos").delete().eq("id", videoId));
 }
 
 /** Atualiza o status a partir do webhook do provedor (sem escopo de professor). */
-export function applyVideoWebhook(
+export async function applyVideoWebhook(
   providerVideoId: string,
   status: VideoStatus,
   metadata: { thumbnail_url?: string | null; duration_seconds?: number | null } = {},
-): boolean {
-  const db = getDb();
-  const video = db.videos.find((item) => item.provider_video_id === providerVideoId);
+): Promise<boolean> {
+  if (!isAdminClientAvailable()) {
+    throw new ApiError(503, "INTERNAL_ERROR", "Webhook indisponível sem SUPABASE_SECRET_KEY");
+  }
+
+  const admin = createAdminClient();
+  const { data: video, error } = await admin
+    .from("videos")
+    .select("id")
+    .eq("provider_video_id", providerVideoId)
+    .maybeSingle();
+
+  if (error) throw mapPostgrestError(error);
   if (!video) return false;
 
-  mutate((database) => {
-    const record = database.videos.find((item) => item.id === video.id);
-    if (!record) return;
-    record.status = status;
-    if (metadata.thumbnail_url !== undefined) record.thumbnail_url = metadata.thumbnail_url;
-    if (metadata.duration_seconds !== undefined) record.duration_seconds = metadata.duration_seconds;
-    if (status === "ready" && !record.playback_url) record.playback_url = DEMO_VIDEO_URL;
-    record.updated_at = nowIso();
-  });
+  const payload: {
+    status: VideoStatus;
+    thumbnail_url?: string | null;
+    duration_seconds?: number | null;
+    playback_url?: string;
+  } = { status };
+  if (metadata.thumbnail_url !== undefined) payload.thumbnail_url = metadata.thumbnail_url;
+  if (metadata.duration_seconds !== undefined) {
+    payload.duration_seconds = metadata.duration_seconds;
+  }
+  if (status === "ready") payload.playback_url = DEMO_VIDEO_URL;
+
+  const result = await admin.from("videos").update(payload).eq("id", video.id);
+  unwrapVoid(result);
   return true;
 }
 
-export function searchVideos(
+export async function searchVideos(
   teacherId: string,
-  options: { search?: string; includeArchived?: boolean; page?: number; pageSize?: number } = {},
-): { videos: VideoWithContext[]; pagination: ReturnType<typeof buildPagination> } {
-  const db = getDb();
-  const page = options.page ?? 1;
-  const pageSize = options.pageSize ?? 20;
-  const search = (options.search ?? "").trim().toLowerCase();
+  options: {
+    search?: string;
+    includeArchived?: boolean;
+    page?: number;
+    pageSize?: number;
+  } = {},
+): Promise<{
+  videos: VideoWithContext[];
+  pagination: ReturnType<typeof buildPagination>;
+}> {
+  const supabase = await createClient();
+  const page = Math.max(1, options.page ?? 1);
+  const pageSize = Math.min(Math.max(1, options.pageSize ?? 20), 100);
+  const from = (page - 1) * pageSize;
 
-  let videos = db.videos.filter((item) => item.teacher_id === teacherId);
-  if (!options.includeArchived) videos = videos.filter((item) => item.status !== "archived");
-  if (search) videos = videos.filter((item) => item.title.toLowerCase().includes(search));
+  let query = supabase
+    .from("videos")
+    .select("*", { count: "exact" })
+    .eq("teacher_id", teacherId)
+    .order("created_at", { ascending: false })
+    .range(from, from + pageSize - 1);
 
-  const withContext: VideoWithContext[] = videos
-    .sort((a, b) => b.created_at.localeCompare(a.created_at))
-    .map((video) => {
-      const moduleRecord = db.modules.find((item) => item.id === video.module_id);
-      const technique = db.techniques.find((item) => item.id === video.technique_id);
-      return {
-        ...video,
-        module_name: moduleRecord?.name ?? "Módulo",
-        technique_name: technique?.name ?? "Técnica",
-      };
-    });
+  if (!options.includeArchived) query = query.neq("status", "archived");
+  const search = (options.search ?? "").trim();
+  if (search) query = query.ilike("title", `%${search}%`);
+
+  const { data, error, count } = await query;
+  if (error) throw mapPostgrestError(error);
+
+  const videos = data ?? [];
+  const moduleIds = Array.from(new Set(videos.map((item) => item.module_id)));
+  const techniqueIds = Array.from(new Set(videos.map((item) => item.technique_id)));
+
+  const [modules, techniques] = await Promise.all([
+    moduleIds.length > 0
+      ? supabase.from("modules").select("id, name").in("id", moduleIds)
+      : Promise.resolve({ data: [], error: null }),
+    techniqueIds.length > 0
+      ? supabase.from("techniques").select("id, name").in("id", techniqueIds)
+      : Promise.resolve({ data: [], error: null }),
+  ]);
+
+  if (modules.error) throw mapPostgrestError(modules.error);
+  if (techniques.error) throw mapPostgrestError(techniques.error);
+
+  const moduleNames = new Map((modules.data ?? []).map((item) => [item.id, item.name]));
+  const techniqueNames = new Map((techniques.data ?? []).map((item) => [item.id, item.name]));
+
+  const withContext: VideoWithContext[] = videos.map((video) => ({
+    ...video,
+    module_name: moduleNames.get(video.module_id) ?? "Módulo",
+    technique_name: techniqueNames.get(video.technique_id) ?? "Técnica",
+  }));
 
   return {
-    videos: paginate(withContext, page, pageSize),
-    pagination: buildPagination(withContext.length, page, pageSize),
+    videos: withContext,
+    pagination: buildPagination(count ?? 0, page, pageSize),
   };
 }
 
 /** Gera URL de reprodução para o professor, exigindo status ready. */
-export function getTeacherPlaybackUrl(videoId: string, teacherId: string): string {
-  const video = ownedVideo(videoId, teacherId);
+export async function getTeacherPlaybackUrl(
+  videoId: string,
+  teacherId: string,
+): Promise<string> {
+  const video = await ownedVideo(videoId, teacherId);
   if (video.status !== "ready") {
     throw ApiError.conflict("O vídeo ainda não está disponível para reprodução");
   }
@@ -495,66 +774,112 @@ export function getTeacherPlaybackUrl(videoId: string, teacherId: string): strin
 /* Permissões de biblioteca                                                    */
 /* -------------------------------------------------------------------------- */
 
-export function grantTechniqueAccess(
+export async function grantTechniqueAccess(
   teacherId: string,
   enrollmentId: string,
   techniqueId: string,
-): TechniqueAccess {
-  const db = getDb();
-  const enrollment = db.enrollments.find((item) => item.id === enrollmentId);
+): Promise<TechniqueAccess> {
+  const supabase = await createClient();
+
+  const enrollment = unwrapMaybe(
+    await supabase
+      .from("enrollments")
+      .select("id, teacher_id")
+      .eq("id", enrollmentId)
+      .maybeSingle(),
+  );
   if (!enrollment) throw ApiError.notFound("Aluno não encontrado");
   if (enrollment.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
-  const technique = ownedTechnique(techniqueId, teacherId);
+
+  const technique = await ownedTechnique(techniqueId, teacherId);
   if (technique.status === "archived") throw ApiError.conflict("Técnica arquivada");
 
-  const existing = db.student_technique_access.find(
-    (item) =>
-      item.enrollment_id === enrollmentId &&
-      item.technique_id === techniqueId &&
-      !item.revoked_at,
+  const existing = unwrapMaybe(
+    await supabase
+      .from("student_technique_access")
+      .select("id")
+      .eq("enrollment_id", enrollmentId)
+      .eq("technique_id", techniqueId)
+      .is("revoked_at", null)
+      .maybeSingle(),
   );
   if (existing) throw ApiError.conflict("O aluno já tem acesso a esta técnica");
 
-  const access: TechniqueAccess = {
-    id: randomUUID(),
-    teacher_id: teacherId,
-    enrollment_id: enrollmentId,
-    technique_id: techniqueId,
-    module_id: null,
-    video_id: null,
-    granted_at: nowIso(),
-    revoked_at: null,
-  };
-  mutate((database) => {
-    database.student_technique_access.push(access);
-  });
-  return access;
+  const { data, error } = await supabase
+    .from("student_technique_access")
+    .insert({
+      teacher_id: teacherId,
+      enrollment_id: enrollmentId,
+      technique_id: techniqueId,
+      module_id: null,
+      video_id: null,
+      revoked_at: null,
+    })
+    .select("*")
+    .single();
+
+  if (error) throw mapPostgrestError(error);
+  return data;
 }
 
-export function revokeAccess(accessId: string, teacherId: string): void {
-  const access = getDb().student_technique_access.find((item) => item.id === accessId);
+export async function revokeAccess(accessId: string, teacherId: string): Promise<void> {
+  const supabase = await createClient();
+  const access = unwrapMaybe(
+    await supabase
+      .from("student_technique_access")
+      .select("id, teacher_id")
+      .eq("id", accessId)
+      .maybeSingle(),
+  );
+
   if (!access) throw ApiError.notFound("Permissão não encontrada");
   if (access.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
-  mutate((db) => {
-    const record = db.student_technique_access.find((item) => item.id === accessId);
-    if (record) record.revoked_at = nowIso();
-  });
+
+  unwrapVoid(
+    await supabase
+      .from("student_technique_access")
+      .update({ revoked_at: new Date().toISOString() })
+      .eq("id", accessId),
+  );
 }
 
-export function getAccessForEnrollment(
+export async function getAccessForEnrollment(
   enrollmentId: string,
   teacherId: string,
-): Array<TechniqueAccess & { technique_name: string }> {
-  const db = getDb();
-  const enrollment = db.enrollments.find((item) => item.id === enrollmentId);
+): Promise<Array<TechniqueAccess & { technique_name: string }>> {
+  const supabase = await createClient();
+
+  const enrollment = unwrapMaybe(
+    await supabase
+      .from("enrollments")
+      .select("id, teacher_id")
+      .eq("id", enrollmentId)
+      .maybeSingle(),
+  );
   if (!enrollment) throw ApiError.notFound("Aluno não encontrado");
   if (enrollment.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
 
-  return db.student_technique_access
-    .filter((item) => item.enrollment_id === enrollmentId && !item.revoked_at)
-    .map((item) => ({
-      ...item,
-      technique_name:
-        db.techniques.find((technique) => technique.id === item.technique_id)?.name ?? "Técnica",
-    }));
+  const { data, error } = await supabase
+    .from("student_technique_access")
+    .select("*")
+    .eq("enrollment_id", enrollmentId)
+    .is("revoked_at", null);
+
+  if (error) throw mapPostgrestError(error);
+
+  const access = data ?? [];
+  const techniqueIds = Array.from(
+    new Set(access.map((item) => item.technique_id).filter((id): id is string => Boolean(id))),
+  );
+
+  const techniques = techniqueIds.length
+    ? await supabase.from("techniques").select("id, name").in("id", techniqueIds)
+    : { data: [], error: null };
+  if (techniques.error) throw mapPostgrestError(techniques.error);
+
+  const names = new Map((techniques.data ?? []).map((item) => [item.id, item.name]));
+  return access.map((item) => ({
+    ...item,
+    technique_name: item.technique_id ? names.get(item.technique_id) ?? "Técnica" : "Técnica",
+  }));
 }

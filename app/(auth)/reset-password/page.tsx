@@ -7,11 +7,12 @@ export const metadata: Metadata = { title: "Redefinir senha" };
 export default async function ResetPasswordPage({
   searchParams,
 }: {
-  searchParams: Promise<{ token?: string }>;
+  searchParams: Promise<{ token?: string; code?: string }>;
 }) {
-  const { token } = await searchParams;
+  const { token, code } = await searchParams;
+  const recoveryToken = token ?? code;
 
-  if (!token) {
+  if (!recoveryToken) {
     return (
       <div className="surface p-6 text-center">
         <h2 className="text-lg font-semibold">Link inválido</h2>
@@ -25,5 +26,5 @@ export default async function ResetPasswordPage({
     );
   }
 
-  return <ResetPasswordForm token={token} />;
+  return <ResetPasswordForm token={recoveryToken} />;
 }

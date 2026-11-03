@@ -24,7 +24,7 @@ export default async function SettingsPage({
   const params = await searchParams;
   const session = await getCurrentSession();
   if (!session) redirect("/login");
-  const data = getProfileView(session.user.id);
+  const data = await getProfileView(session.user.id);
   const googleStatus = getGoogleOAuthStatus(session.user.id);
   const driveStatus = await getDriveConnectionStatus(session.user.id);
 
@@ -103,7 +103,11 @@ export default async function SettingsPage({
             </Alert>
           ) : null}
 
-          <GoogleDriveStatus redirectPath="/settings" initialStatus={driveStatus} />
+          <GoogleDriveStatus
+            redirectPath="/settings"
+            initialStatus={driveStatus}
+            readOnly
+          />
 
           <Alert>
             <p className="font-medium">Ambiente de demonstração</p>

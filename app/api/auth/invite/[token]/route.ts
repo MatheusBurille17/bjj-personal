@@ -6,7 +6,7 @@ export const runtime = "nodejs";
 
 export const GET = route<{ token: string }>(async (_request, context) => {
   const { token } = await context.params;
-  const invite = verifyInviteToken(token);
+  const invite = await verifyInviteToken(token);
   return jsonSuccess({
     valid: true,
     teacher_name: invite.teacher_name,

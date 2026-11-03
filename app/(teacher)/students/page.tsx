@@ -16,7 +16,7 @@ export default async function StudentsPage({
   if (!session) redirect("/login");
   const params = await searchParams;
 
-  const result = getEnrollments(session.user.id, {
+  const result = await getEnrollments(session.user.id, {
     search: "",
     status: ["active", "paused", "pending"],
     page: 1,

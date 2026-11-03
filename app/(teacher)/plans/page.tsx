@@ -15,7 +15,7 @@ export default async function PlansPage({
   const session = await getCurrentSession();
   if (!session) redirect("/login");
   const params = await searchParams;
-  const result = getPlans(session.user.id, {
+  const result = await getPlans(session.user.id, {
     status: ["draft", "published"],
     page: 1,
     pageSize: 20,

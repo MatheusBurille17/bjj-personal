@@ -24,7 +24,7 @@ export const dynamic = "force-dynamic";
 export default async function StudentDashboardPage() {
   const session = await getCurrentSession();
   if (!session) redirect("/login");
-  const data = getStudentDashboard(session.user.id);
+  const data = await getStudentDashboard(session.user.id);
 
   return (
     <div>

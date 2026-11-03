@@ -17,6 +17,7 @@
     "format": "prettier --write .",
     "migrate": "node -e \"console.log('Migrações SQL em supabase/migrations. Aplique com: supabase db push')\"",
     "verify:supabase": "node scripts/verify-supabase.mjs",
+    "seed:supabase": "node scripts/seed-supabase.mjs",
     "migrate:videos": "node scripts/migrate-mux-to-google-drive.mjs"
   },
   "dependencies": {
@@ -51,6 +52,7 @@
     "eslint-config-next": "^15.5.0",
     "fast-check": "^4.3.0",
     "jsdom": "^26.1.0",
+    "pg": "^8.23.1",
     "postcss": "^8.5.6",
     "prettier": "^3.6.2",
     "tailwindcss": "^3.4.17",

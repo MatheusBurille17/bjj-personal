@@ -10,8 +10,8 @@ export const dynamic = "force-dynamic";
 export default async function StudentHistoryPage() {
   const session = await getCurrentSession();
   if (!session) redirect("/login");
-  const history = getStudentHistory(session.user.id, { page: 1, pageSize: 20 });
-  const teachers = getStudentTeachers(session.user.id);
+  const history = await getStudentHistory(session.user.id, { page: 1, pageSize: 20 });
+  const teachers = await getStudentTeachers(session.user.id);
 
   return <StudentHistoryView initial={history} teachers={teachers} />;
 }

@@ -1,12 +1,10 @@
-import { randomBytes, randomUUID } from "node:crypto";
 import type { AuthResult, UserRole } from "@/types/auth";
-import { getDb, mutate, nowIso } from "@/lib/db/store";
-import { buildAuthResult, getUserRoles } from "@/lib/auth/session";
-import { hashPassword, verifyPassword } from "@/lib/auth/password";
+import { buildAuthResult, ensureAccountRecords, getUserRoles } from "@/lib/auth/session";
+import { createClient } from "@/lib/supabase/server";
+import { createAdminClient, isAdminClientAvailable } from "@/lib/supabase/admin";
+import { mapPostgrestError, unwrapVoid } from "@/lib/supabase/errors";
 import { ApiError } from "@/lib/middleware/errors";
 import { isValidTimezone } from "@/lib/utils/validation";
-import { sendEmail } from "@/lib/resend/send";
-import { passwordRecoveryEmail } from "@/lib/resend/templates";
 import type { ProfileUpdateInput, SignupInput } from "@/lib/validation/auth";
 import { getProfileView } from "./profile.service";
 
@@ -15,144 +13,206 @@ export interface LoginInput {
   password: string;
 }
 
+const GENERIC_RECOVERY_MESSAGE =
+  "Se existir uma conta com este e-mail, enviaremos um link de recuperação.";
+
 function appUrl(): string {
   return process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000";
 }
 
-/**
- * Cria uma conta de professor com perfil e configuração de professor.
- * Requisitos 1.1, 1.5, 3.1, 3.3.
- */
-export async function createTeacherAccount(input: SignupInput): Promise<AuthResult> {
-  const email = input.email.toLowerCase();
-  const db = getDb();
+interface AuthErrorLike {
+  message: string;
+  status?: number;
+  code?: string;
+}
 
-  if (db.users.some((user) => user.email.toLowerCase() === email)) {
+/** Traduz erros do Supabase Auth para o formato da API. */
+function throwAuthError(error: AuthErrorLike): never {
+  const message = error.message.toLowerCase();
+
+  if (message.includes("already registered") || message.includes("already been registered")) {
     throw new ApiError(409, "CONFLICT", "Já existe uma conta com este e-mail");
   }
+  if (message.includes("invalid login credentials")) {
+    throw new ApiError(401, "UNAUTHORIZED", "E-mail ou senha inválidos");
+  }
+  if (message.includes("email not confirmed")) {
+    throw new ApiError(
+      403,
+      "FORBIDDEN",
+      "Confirme seu e-mail antes de entrar. Verifique a caixa de entrada.",
+    );
+  }
+  if (message.includes("password")) {
+    throw ApiError.validation("A senha não atende aos requisitos mínimos");
+  }
 
-  const userId = randomUUID();
-  const timestamp = nowIso();
-  const passwordHash = hashPassword(input.password);
+  console.error("[auth] erro do Supabase", error);
+  throw new ApiError(400, "VALIDATION_ERROR", error.message);
+}
 
-  mutate((database) => {
-    database.users.push({
-      id: userId,
-      email,
-      password_hash: passwordHash,
-      email_confirmed_at: null,
-      created_at: timestamp,
-      updated_at: timestamp,
-    });
-    database.profiles.push({
+async function insertTeacherRecords(
+  userId: string,
+  email: string,
+  input: SignupInput,
+): Promise<void> {
+  const client = isAdminClientAvailable() ? createAdminClient() : await createClient();
+
+  const profile = await client.from("profiles").upsert(
+    {
       id: userId,
       full_name: input.fullName,
       email,
       avatar_url: null,
-      created_at: timestamp,
-      updated_at: timestamp,
-    });
-    database.teachers.push({
+    },
+    { onConflict: "id" },
+  );
+  unwrapVoid(profile);
+
+  const teacher = await client.from("teachers").upsert(
+    {
       id: userId,
       display_name: input.displayName,
       timezone: input.timezone,
       bio: null,
-      created_at: timestamp,
-      updated_at: timestamp,
-    });
-  });
+    },
+    { onConflict: "id" },
+  );
+  unwrapVoid(teacher);
+}
 
+/**
+ * Cria uma conta de professor com perfil e configuração de professor.
+ * Usa o Admin API para confirmar o e-mail automaticamente quando a secret key
+ * está disponível; caso contrário, exige confirmação por e-mail.
+ */
+export async function createTeacherAccount(input: SignupInput): Promise<AuthResult> {
+  const email = input.email.toLowerCase();
+  const supabase = await createClient();
+  let userId: string;
+
+  if (isAdminClientAvailable()) {
+    const admin = createAdminClient();
+    const { data, error } = await admin.auth.admin.createUser({
+      email,
+      password: input.password,
+      email_confirm: true,
+      user_metadata: {
+        full_name: input.fullName,
+        display_name: input.displayName,
+        timezone: input.timezone,
+        signup_role: "teacher",
+      },
+    });
+
+    if (error) throwAuthError(error);
+    userId = data.user.id;
+
+    const signIn = await supabase.auth.signInWithPassword({
+      email,
+      password: input.password,
+    });
+    if (signIn.error) throwAuthError(signIn.error);
+  } else {
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password: input.password,
+      options: {
+        data: {
+          full_name: input.fullName,
+          display_name: input.displayName,
+          timezone: input.timezone,
+          signup_role: "teacher",
+        },
+      },
+    });
+
+    if (error) throwAuthError(error);
+    if (!data.user) throw new ApiError(400, "VALIDATION_ERROR", "Não foi possível criar a conta");
+    if (!data.session) {
+      throw new ApiError(
+        403,
+        "FORBIDDEN",
+        "Conta criada. Confirme o e-mail para ativar o acesso ou configure SUPABASE_SECRET_KEY para confirmação automática.",
+      );
+    }
+    userId = data.user.id;
+  }
+
+  await insertTeacherRecords(userId, email, input);
   return buildAuthResult(userId, "teacher");
 }
 
 /**
- * Autentica um usuário e cria a sessão. A mensagem de erro é genérica para
- * não revelar a existência do e-mail (Requisitos 4.2, 5.6).
+ * Autentica um usuário. A mensagem de erro é genérica para não revelar a
+ * existência do e-mail.
  */
 export async function login(input: LoginInput): Promise<AuthResult> {
-  const db = getDb();
-  const user = db.users.find(
-    (item) => item.email.toLowerCase() === input.email.toLowerCase(),
-  );
+  const supabase = await createClient();
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email: input.email.toLowerCase(),
+    password: input.password,
+  });
 
-  if (!user || !verifyPassword(input.password, user.password_hash)) {
+  if (error) {
+    if (error.message.toLowerCase().includes("email not confirmed")) {
+      throwAuthError(error);
+    }
     throw new ApiError(401, "UNAUTHORIZED", "E-mail ou senha inválidos");
   }
 
-  const roles = getUserRoles(user.id);
+  const userId = data.user.id;
+  await ensureAccountRecords(supabase, data.user);
+  const roles = await getUserRoles(userId, supabase);
   if (!roles.is_teacher && !roles.is_student) {
+    await supabase.auth.signOut();
     throw new ApiError(403, "FORBIDDEN", "Sua conta ainda não possui um vínculo ativo");
   }
 
-  const role: UserRole = roles.is_teacher ? "teacher" : "student";
-  return buildAuthResult(user.id, role);
+  return buildAuthResult(userId, roles.is_teacher ? "teacher" : "student");
 }
 
 /**
- * Inicia a recuperação de senha. Sempre retorna sucesso, exista ou não a conta.
+ * Inicia a recuperação de senha via Supabase Auth. Sempre retorna a mesma
+ * mensagem, exista ou não a conta.
  */
 export async function requestPasswordRecovery(email: string): Promise<{ message: string }> {
-  const db = getDb();
-  const user = db.users.find((item) => item.email.toLowerCase() === email.toLowerCase());
-  const genericMessage =
-    "Se existir uma conta com este e-mail, enviaremos um link de recuperação.";
-
-  if (!user) return { message: genericMessage };
-
-  const token = randomBytes(32).toString("hex");
-  const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-  const profile = db.profiles.find((item) => item.id === user.id);
-
-  mutate((database) => {
-    database.password_resets.push({
-      id: randomUUID(),
-      user_id: user.id,
-      token,
-      expires_at: expiresAt,
-      used_at: null,
-      created_at: nowIso(),
-    });
+  const supabase = await createClient();
+  const { error } = await supabase.auth.resetPasswordForEmail(email.toLowerCase(), {
+    redirectTo: `${appUrl()}/reset-password`,
   });
 
-  const template = passwordRecoveryEmail({
-    fullName: profile?.full_name ?? "aluno",
-    resetUrl: `${appUrl()}/reset-password?token=${token}`,
-  });
-
-  await sendEmail({
-    to: user.email,
-    subject: template.subject,
-    html: template.html,
-    kind: "recovery",
-    payload: { token, reset_url: `${appUrl()}/reset-password?token=${token}` },
-  });
-
-  return { message: genericMessage };
-}
-
-/** Conclui a redefinição de senha a partir de um token válido. */
-export async function resetPassword(token: string, password: string): Promise<void> {
-  const db = getDb();
-  const record = db.password_resets.find(
-    (item) => item.token === token && !item.used_at,
-  );
-
-  if (!record || new Date(record.expires_at).getTime() <= Date.now()) {
-    throw new ApiError(400, "VALIDATION_ERROR", "Link de recuperação inválido ou expirado");
+  if (error) {
+    console.error("[auth] falha ao solicitar recuperação", error);
   }
 
-  mutate((database) => {
-    const user = database.users.find((item) => item.id === record.user_id);
-    if (!user) throw new ApiError(404, "NOT_FOUND", "Conta não encontrada");
-    user.password_hash = hashPassword(password);
-    user.updated_at = nowIso();
-    record.used_at = nowIso();
-  });
+  return { message: GENERIC_RECOVERY_MESSAGE };
+}
+
+/**
+ * Conclui a redefinição de senha.
+ *
+ * `token` pode ser o `code` enviado pelo Supabase no link de recuperação; nesse
+ * caso a sessão é trocada antes de atualizar a senha. Se o usuário já chegou
+ * autenticado pelo link, basta atualizar a senha.
+ */
+export async function resetPassword(token: string | undefined, password: string): Promise<void> {
+  const supabase = await createClient();
+
+  if (token) {
+    const exchange = await supabase.auth.exchangeCodeForSession(token);
+    if (exchange.error) {
+      throw ApiError.validation("Link de recuperação inválido ou expirado");
+    }
+  }
+
+  const { error } = await supabase.auth.updateUser({ password });
+  if (error) throwAuthError(error);
 }
 
 /** Alterna a visão ativa entre professor e aluno. */
 export async function switchRole(userId: string, role: UserRole): Promise<AuthResult> {
-  const roles = getUserRoles(userId);
+  const roles = await getUserRoles(userId);
   if (role === "teacher" && !roles.is_teacher) {
     throw new ApiError(403, "FORBIDDEN", "Você não possui perfil de professor");
   }
@@ -164,7 +224,9 @@ export async function switchRole(userId: string, role: UserRole): Promise<AuthRe
 
 /** Atualiza o perfil do usuário autenticado. */
 export async function updateOwnProfile(userId: string, data: ProfileUpdateInput) {
-  const roles = getUserRoles(userId);
+  const supabase = await createClient();
+  const roles = await getUserRoles(userId, supabase);
+
   if ((data.display_name !== undefined || data.timezone !== undefined) && !roles.is_teacher) {
     throw new ApiError(403, "FORBIDDEN", "Somente professores podem alterar estes campos");
   }
@@ -184,25 +246,26 @@ export async function updateOwnProfile(userId: string, data: ProfileUpdateInput)
     });
   }
 
-  mutate((database) => {
-    const profile = database.profiles.find((item) => item.id === userId);
-    if (!profile) throw new ApiError(404, "NOT_FOUND", "Perfil não encontrado");
-    const timestamp = nowIso();
+  const profileUpdate: { full_name?: string; avatar_url?: string | null } = {};
+  if (data.full_name !== undefined) profileUpdate.full_name = data.full_name;
+  if (data.avatar_url !== undefined) profileUpdate.avatar_url = data.avatar_url;
 
-    if (data.full_name !== undefined) profile.full_name = data.full_name;
-    if (data.avatar_url !== undefined) profile.avatar_url = data.avatar_url;
-    profile.updated_at = timestamp;
+  if (Object.keys(profileUpdate).length > 0) {
+    const result = await supabase.from("profiles").update(profileUpdate).eq("id", userId);
+    unwrapVoid(result);
+  }
 
-    if (roles.is_teacher && (data.display_name !== undefined || data.timezone !== undefined || data.bio !== undefined)) {
-      const teacher = database.teachers.find((item) => item.id === userId);
-      if (teacher) {
-        if (data.display_name !== undefined) teacher.display_name = data.display_name;
-        if (data.timezone !== undefined) teacher.timezone = data.timezone;
-        if (data.bio !== undefined) teacher.bio = data.bio;
-        teacher.updated_at = timestamp;
-      }
+  if (roles.is_teacher) {
+    const teacherUpdate: { display_name?: string; timezone?: string; bio?: string | null } = {};
+    if (data.display_name !== undefined) teacherUpdate.display_name = data.display_name;
+    if (data.timezone !== undefined) teacherUpdate.timezone = data.timezone;
+    if (data.bio !== undefined) teacherUpdate.bio = data.bio;
+
+    if (Object.keys(teacherUpdate).length > 0) {
+      const result = await supabase.from("teachers").update(teacherUpdate).eq("id", userId);
+      unwrapVoid(result);
     }
-  });
+  }
 
   return getProfileView(userId);
 }

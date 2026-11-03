@@ -7,7 +7,7 @@ export const runtime = "nodejs";
 export const POST = route<{ id: string }>(async (_request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
-  const moduleRecord = archiveModule(id, session.user.id);
+  const moduleRecord = await archiveModule(id, session.user.id);
   try {
     await archiveDriveModuleAssets(session.user.id, id);
   } catch (error) {

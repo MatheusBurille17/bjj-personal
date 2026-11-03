@@ -7,7 +7,7 @@ export const runtime = "nodejs";
 export const POST = route<{ id: string }>(async (_request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
-  const video = archiveVideo(id, session.user.id);
+  const video = await archiveVideo(id, session.user.id);
   try {
     await archiveDriveVideoAssets(session.user.id, id);
   } catch (error) {

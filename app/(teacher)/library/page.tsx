@@ -15,7 +15,7 @@ export default async function LibraryPage({
   const session = await getCurrentSession();
   if (!session) redirect("/login");
   const params = await searchParams;
-  const tree = getLibraryTree(session.user.id, true);
+  const tree = await getLibraryTree(session.user.id, true);
 
   return <LibraryView tree={tree} initialNew={params.new === "1"} />;
 }

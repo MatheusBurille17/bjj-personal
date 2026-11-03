@@ -14,7 +14,7 @@ export const runtime = "nodejs";
 export const GET = route(async (request) => {
   const session = await requireApiTeacher();
   const { searchParams } = new URL(request.url);
-  const result = getTechniques(session.user.id, {
+  const result = await getTechniques(session.user.id, {
     includeArchived: searchParams.get("includeArchived") === "true",
     page: parseQueryInt(searchParams.get("page"), 1),
     pageSize: parseQueryInt(searchParams.get("pageSize"), 20),
@@ -25,5 +25,5 @@ export const GET = route(async (request) => {
 export const POST = route(async (request) => {
   const session = await requireApiTeacher();
   const data = createTechniqueSchema.parse(await parseJson(request));
-  return jsonCreated(createTechnique(session.user.id, data));
+  return jsonCreated(await createTechnique(session.user.id, data));
 });

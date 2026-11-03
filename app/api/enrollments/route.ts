@@ -26,7 +26,7 @@ export const GET = route(async (request) => {
     pageSize: searchParams.get("pageSize") ?? undefined,
   });
 
-  const result = getEnrollments(session.user.id, query);
+  const result = await getEnrollments(session.user.id, query);
   return jsonSuccess(result, { pagination: result.pagination });
 });
 

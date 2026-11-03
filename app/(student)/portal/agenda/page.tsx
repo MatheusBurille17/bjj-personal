@@ -10,8 +10,8 @@ export const dynamic = "force-dynamic";
 export default async function StudentAgendaPage() {
   const session = await getCurrentSession();
   if (!session) redirect("/login");
-  const lessons = getStudentAgenda(session.user.id);
-  const teachers = getStudentTeachers(session.user.id);
+  const lessons = await getStudentAgenda(session.user.id);
+  const teachers = await getStudentTeachers(session.user.id);
 
   return <StudentAgendaView initialLessons={lessons} teachers={teachers} />;
 }

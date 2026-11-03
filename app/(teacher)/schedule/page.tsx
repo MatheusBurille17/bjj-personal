@@ -23,23 +23,27 @@ export default async function SchedulePage({
   if (!session) redirect("/login");
   const params = await searchParams;
 
-  const agenda = getWeeklyAgenda(session.user.id);
-  const slots = getWeeklySlots(session.user.id);
-  const enrollments = getEnrollments(session.user.id, {
-    search: "",
-    status: ["active", "paused"],
-    page: 1,
-    pageSize: 100,
-  }).enrollments;
+  const agenda = await getWeeklyAgenda(session.user.id);
+  const slots = await getWeeklySlots(session.user.id);
+  const enrollments = (
+    await getEnrollments(session.user.id, {
+      search: "",
+      status: ["active", "paused"],
+      page: 1,
+      pageSize: 100,
+    })
+  ).enrollments;
 
-  const plans = getPlans(session.user.id, {
-    status: ["published", "draft"],
-    page: 1,
-    pageSize: 100,
-  }).plans;
+  const plans = (
+    await getPlans(session.user.id, {
+      status: ["published", "draft"],
+      page: 1,
+      pageSize: 100,
+    })
+  ).plans;
   const planDays: PlanDayOption[] = [];
   for (const plan of plans) {
-    const detail = getPlanDetail(plan.id, session.user.id);
+    const detail = await getPlanDetail(plan.id, session.user.id);
     for (const day of detail.days) {
       planDays.push({
         id: day.id,
@@ -51,7 +55,7 @@ export default async function SchedulePage({
     }
   }
 
-  const tree = getLibraryTree(session.user.id);
+  const tree = await getLibraryTree(session.user.id);
   const videos: VideoOption[] = [];
   for (const technique of tree.techniques) {
     for (const moduleRecord of tree.modules[technique.id] ?? []) {
