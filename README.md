@@ -9,10 +9,12 @@ Plataforma web responsiva para professores particulares de Jiu-Jitsu planejarem 
 ## Funcionalidades
 
 ### Autenticação e perfis
-- Cadastro e login de professor com e-mail/senha, sessão em cookie `httpOnly` assinado.
-- Login, cadastro e conexão de conta Google (OAuth 2.0 + PKCE), com tokens
-  criptografados (AES-256-GCM), refresh automático, desconexão e auditoria.
-  Veja [`docs/google-social-authentication.md`](docs/google-social-authentication.md).
+- Cadastro e login de professor com e-mail/senha via Supabase Auth (cookies
+  `httpOnly`) e sessão validada no servidor.
+- Login, cadastro e conexão de conta Google pelo **provider Google do Supabase
+  Auth**, com tokens criptografados (AES-256-GCM), refresh automático,
+  desconexão e auditoria. Veja
+  [`docs/google-social-authentication.md`](docs/google-social-authentication.md).
 - Armazenamento de vídeos no Google Drive (instrutor e aluno), upload em chunks,
   URL de reprodução efêmera, compartilhamento nativo, auditoria de acessos,
   migração Mux → Drive e modo híbrido. Login social e Drive usam **um único
@@ -139,15 +141,19 @@ supabase db push
 3. Configure o bucket `avatars` (a migração já cria) e as políticas RLS.
 4. Configure o webhook da Mux para `POST /api/library/videos/webhook` e defina `MUX_WEBHOOK_SECRET`.
 5. Defina `AUTH_SECRET` com pelo menos 32 caracteres e `NEXT_PUBLIC_APP_URL` com o domínio público.
-6. Para login com Google, defina `NEXT_PUBLIC_GOOGLE_CLIENT_ID`,
-   `GOOGLE_CLIENT_SECRET`, `NEXT_PUBLIC_GOOGLE_REDIRECT_URI` e
-   `GOOGLE_TOKEN_ENCRYPTION_KEY` (chave dedicada, distinta por ambiente). O passo
-   a passo do Google Cloud está em
+6. Para login com Google, habilite o provider Google no Supabase Auth
+   (Authentication → Providers → Google), cadastre a redirect URI
+   `https://<PROJECT_REF>.supabase.co/auth/v1/callback` no Google Cloud e
+   adicione `https://SEU_DOMINIO/api/auth/google/callback` às Redirect URLs do
+   Supabase. Defina `NEXT_PUBLIC_GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` (os
+   mesmos do Supabase, usados no refresh do Drive), `GOOGLE_TOKEN_ENCRYPTION_KEY`
+   e `SUPABASE_SECRET_KEY`. O passo a passo está em
    [`docs/google-social-authentication.md`](docs/google-social-authentication.md).
-7. Para armazenamento de vídeos, adicione
-   `NEXT_PUBLIC_GOOGLE_DRIVE_REDIRECT_URI`, `GOOGLE_DRIVE_SCOPES` (padrão
-   `drive.file`), `PLAYBACK_TOKEN_SECRET` e, opcionalmente, os limites de retry.
-   A redirect URI do Drive deve ser cadastrada no Google Cloud. Veja
+7. Para armazenamento de vídeos, adicione `GOOGLE_OAUTH_SCOPES` (padrão
+   `openid email profile https://www.googleapis.com/auth/drive.file`),
+   `PLAYBACK_TOKEN_SECRET` e, opcionalmente, os limites de retry. As rotas
+   legadas do Drive (`NEXT_PUBLIC_GOOGLE_DRIVE_REDIRECT_URI`) só são necessárias
+   se você usar `/api/google-drive/oauth/*` diretamente. Veja
    [`docs/google-drive-video-storage.md`](docs/google-drive-video-storage.md).
 
 > O runtime usa Supabase (Postgres, Auth e RLS). O schema e as políticas estão em `supabase/migrations`; o passo a passo da migração e o que ainda falta estão em [`docs/supabase-migration.md`](docs/supabase-migration.md).

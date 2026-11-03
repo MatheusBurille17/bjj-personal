@@ -8,14 +8,7 @@ import {
 } from "@/lib/middleware/rate-limit";
 import { enforceHttpsInProduction } from "@/lib/utils/https";
 import { sanitizeRedirectPath } from "@/lib/utils/url";
-import {
-  createCodeChallenge,
-  createOAuthState,
-  storeOAuthState,
-} from "@/lib/services/oauth-state.service";
-import {
-  buildDriveAuthorizationUrl,
-} from "@/lib/services/google-drive-token.service";
+import { beginSupabaseGoogleAuthorization } from "@/lib/services/google-supabase-auth.service";
 import { toApiError } from "@/lib/google-oauth-errors";
 
 export const runtime = "nodejs";
@@ -32,17 +25,14 @@ async function prepare(request: Request) {
   const redirectPath =
     sanitizeRedirectPath(url.searchParams.get("redirect_path")) ?? fallback;
 
-  const state = createOAuthState({
-    redirectPath,
-    purpose: "drive",
-    connectMode: true,
-  });
-  await storeOAuthState(state);
-  const challenge = await createCodeChallenge(state.codeVerifier);
   try {
-    const authorizationUrl = buildDriveAuthorizationUrl({
-      state: state.state,
-      codeChallenge: challenge,
+    // Reutiliza o provider Google do Supabase Auth. O callback dedicado do
+    // Drive mantém o retorno em `?drive=connected`.
+    const authorizationUrl = await beginSupabaseGoogleAuthorization({
+      request,
+      redirectPath,
+      connectMode: true,
+      callbackPath: "/api/google-drive/oauth/callback",
     });
     return { rateLimited: false as const, authorizationUrl, limit };
   } catch (error) {

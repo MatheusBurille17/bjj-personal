@@ -9,17 +9,21 @@ import {
 import { enforceHttpsInProduction } from "@/lib/utils/https";
 import { sanitizeRedirectPath } from "@/lib/utils/url";
 import { getCurrentSession } from "@/lib/auth/session";
-import { consumeOAuthState } from "@/lib/services/oauth-state.service";
 import {
-  exchangeDriveCode,
-  storeDriveTokens,
-} from "@/lib/services/google-drive-token.service";
-import { ensureLibraryStructure } from "@/lib/services/google-drive.service";
-import { getGoogleUserProfile } from "@/lib/google-oauth-client";
-import { getDriveAbout } from "@/lib/services/google-drive-client";
-import { logGoogleDriveError } from "@/lib/google-drive-errors";
+  completeSupabaseGoogleAuthorization,
+  consumeGoogleOAuthIntent,
+} from "@/lib/services/google-supabase-auth.service";
+import { logOAuthAuditSupabase } from "@/lib/services/oauth-audit-supabase.service";
+import { GoogleOAuthError } from "@/lib/google-oauth-errors";
 
 export const runtime = "nodejs";
+
+function requestContext(request: Request) {
+  return {
+    ip: getClientIp(request),
+    userAgent: request.headers.get("user-agent"),
+  };
+}
 
 function redirectWithError(
   request: Request,
@@ -27,12 +31,28 @@ function redirectWithError(
   code: string,
   limit: ReturnType<typeof checkRateLimit>,
 ) {
+  const forceLogin =
+    code === "email_mismatch_on_connect" || code === "unauthorized";
   const target = new URL(
-    sanitizeRedirectPath(redirectPath) ?? "/settings",
+    forceLogin ? "/login" : sanitizeRedirectPath(redirectPath) ?? "/settings",
     request.url,
   );
-  target.searchParams.set("drive_error", code);
+  target.searchParams.set(forceLogin ? "error" : "drive_error", code);
   return applyRateLimitHeaders(NextResponse.redirect(target, 303), limit);
+}
+
+function errorCodeFrom(error: unknown): string {
+  if (error instanceof GoogleOAuthError) return error.code;
+  if (error instanceof ApiError) {
+    const details = error.details as { error?: string; drive_error?: string } | undefined;
+    if (details?.drive_error) return details.drive_error;
+    if (details?.error) return details.error;
+    if (error.status === 401) return "unauthorized";
+    if (error.status === 403) return "forbidden";
+    if (error.status === 404) return "not_found";
+    return "server_error";
+  }
+  return "server_error";
 }
 
 export const GET = route(async (request) => {
@@ -41,36 +61,36 @@ export const GET = route(async (request) => {
   enforceHttpsInProduction(request);
 
   const url = new URL(request.url);
-  const stateResult = await consumeOAuthState(url.searchParams.get("state"));
+  const code = url.searchParams.get("code");
   const googleError = url.searchParams.get("error");
+  const intent = await consumeGoogleOAuthIntent();
+  const redirectPath = sanitizeRedirectPath(intent?.next);
+  const context = requestContext(request);
 
   if (googleError) {
-    return redirectWithError(
-      request,
-      stateResult.state?.redirectPath,
-      googleError === "access_denied" ? "access_denied" : "server_error",
-      limit,
-    );
+    const reason =
+      googleError === "access_denied" ? "access_denied" : "server_error";
+    await logOAuthAuditSupabase({
+      event: "google_code_exchange_failed",
+      success: false,
+      ip: context.ip,
+      userAgent: context.userAgent,
+      metadata: { reason, google_error: googleError, flow: "drive" },
+    });
+    return redirectWithError(request, redirectPath, reason, limit);
   }
 
-  if (
-    !stateResult.valid ||
-    !stateResult.state ||
-    stateResult.state.purpose !== "drive"
-  ) {
-    return redirectWithError(
-      request,
-      undefined,
-      stateResult.reason ?? "state_mismatch",
-      limit,
-    );
-  }
-
-  const code = url.searchParams.get("code");
   if (!code) {
+    await logOAuthAuditSupabase({
+      event: "google_code_exchange_failed",
+      success: false,
+      ip: context.ip,
+      userAgent: context.userAgent,
+      metadata: { reason: "missing_code", flow: "drive" },
+    });
     return redirectWithError(
       request,
-      stateResult.state.redirectPath,
+      redirectPath,
       "invalid_request",
       limit,
     );
@@ -81,49 +101,37 @@ export const GET = route(async (request) => {
     if (!session) {
       return redirectWithError(
         request,
-        stateResult.state.redirectPath,
+        redirectPath,
         "unauthorized",
         limit,
       );
     }
 
-    const credential = await exchangeDriveCode(
+    await completeSupabaseGoogleAuthorization({
       code,
-      stateResult.state.codeVerifier,
-    );
-    const profile = await getGoogleUserProfile(credential.access_token);
-    const about = await getDriveAbout(credential.access_token);
-
-    await storeDriveTokens(session.user.id, {
-      accessToken: credential.access_token,
-      refreshToken: credential.refresh_token,
-      expiresIn: credential.expires_in,
-      scope: credential.scope,
-      driveId: about.driveId || profile.email,
-      googleEmail: about.email || profile.email,
+      connectMode: true,
+      connectEmail: intent?.email ?? null,
+      connectUserId: intent?.userId ?? null,
+      context,
     });
-    await ensureLibraryStructure(session.user.id);
 
     const target = new URL(
-      sanitizeRedirectPath(stateResult.state.redirectPath) ?? "/settings",
+      sanitizeRedirectPath(redirectPath) ?? "/settings",
       request.url,
     );
     target.searchParams.set("drive", "connected");
     return applyRateLimitHeaders(NextResponse.redirect(target, 303), limit);
   } catch (error) {
-    logGoogleDriveError(error, "oauth.callback");
-    const code =
-      error instanceof ApiError
-        ? String(
-            (error.details as { drive_error?: string })?.drive_error ??
-              "server_error",
-          )
-        : "server_error";
-    return redirectWithError(
-      request,
-      stateResult.state.redirectPath,
-      code,
-      limit,
-    );
+    const reason = errorCodeFrom(error);
+    const session = await getCurrentSession().catch(() => null);
+    await logOAuthAuditSupabase({
+      event: "google_code_exchange_failed",
+      userId: session?.user.id ?? null,
+      success: false,
+      ip: context.ip,
+      userAgent: context.userAgent,
+      metadata: { reason, flow: "drive" },
+    });
+    return redirectWithError(request, redirectPath, reason, limit);
   }
 });

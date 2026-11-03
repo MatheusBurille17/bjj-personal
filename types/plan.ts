@@ -1,4 +1,5 @@
 import type { Video, VideoStatus } from "./library";
+import type { PaginationMeta } from "./api";
 
 export type PlanStatus = "draft" | "published" | "archived";
 export type Weekday = 0 | 1 | 2 | 3 | 4 | 5 | 6;
@@ -58,6 +59,11 @@ export interface PlanDayWithVideos extends PlanDay {
 export interface PlanDetail extends MonthlyPlanWithCounts {
   days: PlanDayWithVideos[];
   enrollments: PlanEnrollmentInfo[];
+}
+
+export interface PlanListResponse {
+  plans: MonthlyPlanWithCounts[];
+  pagination: PaginationMeta;
 }
 
 export interface PlanEnrollment {

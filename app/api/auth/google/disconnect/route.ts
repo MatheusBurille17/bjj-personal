@@ -6,7 +6,7 @@ import {
   rateLimitResponse,
 } from "@/lib/middleware/rate-limit";
 import { enforceHttpsInProduction } from "@/lib/utils/https";
-import { disconnectGoogleAccount } from "@/lib/services/google-auth.service";
+import { disconnectSupabaseGoogleAccount } from "@/lib/services/google-supabase-token.service";
 
 export const runtime = "nodejs";
 
@@ -17,7 +17,7 @@ export const POST = route(async (request) => {
   enforceHttpsInProduction(request);
 
   const session = await requireApiUser();
-  const result = await disconnectGoogleAccount(session.user.id, {
+  const result = await disconnectSupabaseGoogleAccount(session.user.id, {
     ip: getClientIp(request),
     userAgent: request.headers.get("user-agent"),
   });

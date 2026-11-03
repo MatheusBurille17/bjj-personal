@@ -63,6 +63,11 @@ export function GoogleDriveStatus({
   }, []);
 
   React.useEffect(() => {
+    // Mantém o card sincronizado após router.refresh() (ex.: desconectar).
+    setStatus(initialStatus);
+  }, [initialStatus]);
+
+  React.useEffect(() => {
     // Busca a quota no cliente quando o servidor enviou um status conectado
     // sem os dados de armazenamento.
     if (!initialStatus || (initialStatus.connected && !initialStatus.storage)) {

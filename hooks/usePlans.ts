@@ -3,10 +3,10 @@
 import * as React from "react";
 import { apiFetch } from "@/lib/api/client";
 import type {
-  MonthlyPlanWithCounts,
   PlanDayWithVideos,
   PlanDetail,
   PlanEnrollmentInfo,
+  PlanListResponse,
 } from "@/types/plan";
 import { useApi } from "./useApi";
 
@@ -22,7 +22,7 @@ export function usePlans(params: {
   for (const status of params.statuses ?? ["draft", "published"]) query.append("status", status);
   query.set("page", String(params.page ?? 1));
   query.set("pageSize", String(params.pageSize ?? 20));
-  return useApi<MonthlyPlanWithCounts[]>(`/api/plans?${query}`);
+  return useApi<PlanListResponse>(`/api/plans?${query}`);
 }
 
 /** Dias de um plano, com vídeos associados. */

@@ -71,8 +71,9 @@ quiser.
 |---|---|---|
 | `NEXT_PUBLIC_GOOGLE_CLIENT_ID` | produção | OAuth Client ID (mesmo do login Google) |
 | `GOOGLE_CLIENT_SECRET` | produção | OAuth Client Secret |
-| `NEXT_PUBLIC_GOOGLE_DRIVE_REDIRECT_URI` | produção | `https://SEU_DOMINIO/api/google-drive/oauth/callback` |
+| `NEXT_PUBLIC_GOOGLE_DRIVE_REDIRECT_URI` | legado | `https://SEU_DOMINIO/api/google-drive/oauth/callback` (só nas rotas antigas de OAuth direto) |
 | `GOOGLE_DRIVE_SCOPES` | não | Padrão `openid email https://www.googleapis.com/auth/drive.file` |
+| `GOOGLE_OAUTH_SCOPES` | não | Escopos do provider Google do Supabase (padrão inclui `drive.file`) |
 | `GOOGLE_DRIVE_FOLDER_ROOT` | não | Padrão `Plataforma de Treinamento` |
 | `GOOGLE_DRIVE_API_KEY` | não | Chave pública opcional (não usada no OAuth do usuário) |
 | `GOOGLE_DRIVE_MAX_FILE_BYTES` | não | Padrão 5GB (`5368709120`) |
@@ -81,10 +82,15 @@ quiser.
 | `GOOGLE_DRIVE_CIRCUIT_BREAKER_MS` | não | Pausa após 5 falhas (padrão 5min) |
 | `PLAYBACK_TOKEN_SECRET` | produção | Segredo HMAC das URLs de reprodução (fallback `AUTH_SECRET`) |
 
-O consentimento unificado usa o escopo `https://www.googleapis.com/auth/drive`
-já exigido pelo login social. O fluxo legado do Drive (`/api/google-drive/oauth/*`)
-usa `drive.file`. Prefira `drive.file` em novos projetos que não dependam do
-login social com escopo amplo.
+Com o provider Google do Supabase Auth, o padrão é o escopo
+`https://www.googleapis.com/auth/drive.file`, que dá acesso apenas aos arquivos
+criados pela plataforma e evita a verificação de escopo restrito do Google. O
+fluxo antigo do Drive (`/api/google-drive/oauth/*`) permanece por compatibilidade
+e também delega ao Supabase Auth.
+
+Em produção, os tokens ficam em `user_google_oauth` e `providers_oauth_tokens`
+no Supabase (nunca em `.data/db.json`). O callback do app persiste os
+`provider_token`/`provider_refresh_token` devolvidos pelo Supabase.
 
 ---
 

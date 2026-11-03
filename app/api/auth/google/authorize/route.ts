@@ -9,12 +9,7 @@ import {
 } from "@/lib/middleware/rate-limit";
 import { enforceHttpsInProduction } from "@/lib/utils/https";
 import { sanitizeRedirectPath } from "@/lib/utils/url";
-import { getCurrentSession } from "@/lib/auth/session";
-import {
-  createOAuthState,
-  storeOAuthState,
-} from "@/lib/services/oauth-state.service";
-import { generateAuthorizationUrl } from "@/lib/services/google-auth.service";
+import { beginSupabaseGoogleAuthorization } from "@/lib/services/google-supabase-auth.service";
 import { toApiError } from "@/lib/google-oauth-errors";
 
 export const runtime = "nodejs";
@@ -47,26 +42,16 @@ async function prepareAuthorization(
   }
 
   const connectMode = parseConnectMode(url.searchParams.get("connect_mode"));
-  if (connectMode) {
-    const session = await getCurrentSession();
-    if (!session) {
-      throw ApiError.unauthorized(
-        "Faça login antes de conectar sua conta Google.",
-      );
-    }
-  }
-
-  const oauthState = createOAuthState({ redirectPath, connectMode });
-  await storeOAuthState(oauthState);
 
   try {
-    const result = await generateAuthorizationUrl({
-      state: oauthState.state,
-      codeVerifier: oauthState.codeVerifier,
+    // O provider Google do Supabase Auth cuida do state/PKCE e da troca do
+    // código. O app recebe o callback e persiste os tokens do Drive.
+    const authorizationUrl = await beginSupabaseGoogleAuthorization({
+      request,
       redirectPath,
       connectMode,
     });
-    return { rateLimited: false, authorizationUrl: result.url, limit };
+    return { rateLimited: false, authorizationUrl, limit };
   } catch (error) {
     throw toApiError(error);
   }

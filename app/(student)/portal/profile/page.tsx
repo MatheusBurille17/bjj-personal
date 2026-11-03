@@ -14,8 +14,10 @@ import { AvatarUpload } from "@/components/auth/avatar-upload";
 import { GoogleAccountSection } from "@/components/account/google-account-section";
 import { GoogleDriveStatus } from "@/components/google-drive/google-drive-status";
 import { PersonalVideosSection } from "@/components/video/personal-videos-section";
-import { getGoogleOAuthStatus } from "@/lib/services/google-auth.service";
-import { getDriveConnectionStatus } from "@/lib/services/google-drive-token.service";
+import {
+  getSupabaseDriveConnectionStatus,
+  getSupabaseGoogleStatus,
+} from "@/lib/services/google-supabase-token.service";
 import { CheckCircle2, Users } from "lucide-react";
 import { formatDate } from "@/lib/utils/date";
 
@@ -33,8 +35,8 @@ export default async function StudentProfilePage({
   const profile = await getStudentProfile(session.user.id);
   const teachers = await getStudentTeachers(session.user.id);
   const stats = await getStudentStatistics(session.user.id);
-  const googleStatus = getGoogleOAuthStatus(session.user.id);
-  const driveStatus = await getDriveConnectionStatus(session.user.id);
+  const googleStatus = await getSupabaseGoogleStatus(session.user.id);
+  const driveStatus = await getSupabaseDriveConnectionStatus(session.user.id);
 
   return (
     <div>
@@ -116,7 +118,8 @@ export default async function StudentProfilePage({
             <Alert variant="success">
               <p className="font-medium">Google Drive conectado</p>
               <p className="mt-1 text-xs">
-                Sua pasta de vídeos pessoais está pronta para receber uploads.
+                O acesso ao Drive está ativo. Sua pasta de vídeos pessoais é
+                criada no primeiro upload.
               </p>
             </Alert>
           ) : null}

@@ -400,7 +400,7 @@ describe("integração — ciclo de planos e endpoints", () => {
     await authenticateTeacher();
     const authorized = await planListRoute(request(), { params: Promise.resolve({}) });
     expect(authorized.status).toBe(200);
-    expect((await authorized.json()).data.length).toBeGreaterThan(0);
+    expect((await authorized.json()).data.plans.length).toBeGreaterThan(0);
   });
 
   it("duplicação e arquivamento preservam histórico e estrutura", () => {

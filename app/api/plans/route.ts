@@ -22,7 +22,7 @@ export const GET = route(async (request) => {
     pageSize: searchParams.get("pageSize") ?? undefined,
   });
   const result = await getPlans(session.user.id, query);
-  return jsonSuccess(result.plans, { pagination: result.pagination });
+  return jsonSuccess(result, { pagination: result.pagination });
 });
 
 export const POST = route(async (request) => {

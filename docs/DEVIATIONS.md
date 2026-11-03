@@ -132,6 +132,11 @@ Permanecem fora do MVP, conforme o planejamento original: pagamentos, chat, mark
 
 ## 15. Google Social Authentication
 
+> **Atualização:** o login/cadastro/conexão Google agora usa o **provider Google
+> do Supabase Auth** (`signInWithOAuth`), com os tokens do provider persistidos
+> no Supabase para o Drive. O texto abaixo descreve o MVP local original e fica
+> como registro histórico. Veja `docs/google-social-authentication.md`.
+
 **Spec:** `.kiro/specs/google-social-authentication` (OAuth direto no backend, tokens criptografados, refresh, desconexão, rate limiting e testes de propriedade).
 
 **Implementado:**

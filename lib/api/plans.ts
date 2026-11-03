@@ -6,6 +6,7 @@ import type {
   PlanDayWithVideos,
   PlanDetail,
   PlanEnrollmentInfo,
+  PlanListResponse,
   StudentPlan,
   UpdatePlanData,
   UpdatePlanDayData,
@@ -26,7 +27,7 @@ export function getPlans(params: {
   if (params.to_date) query.set("to_date", params.to_date);
   if (params.page) query.set("page", String(params.page));
   if (params.pageSize) query.set("pageSize", String(params.pageSize));
-  return apiFetch<MonthlyPlanWithCounts[]>(`/api/plans?${query}`);
+  return apiFetch<PlanListResponse>(`/api/plans?${query}`);
 }
 
 export function getPlan(id: string) {

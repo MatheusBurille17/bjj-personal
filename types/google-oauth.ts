@@ -9,7 +9,7 @@ export const GOOGLE_OAUTH_SCOPES = [
   "openid",
   "profile",
   "email",
-  "https://www.googleapis.com/auth/drive",
+  "https://www.googleapis.com/auth/drive.file",
 ] as const;
 
 export type GoogleOAuthScope = (typeof GOOGLE_OAUTH_SCOPES)[number];

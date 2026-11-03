@@ -19,6 +19,11 @@ import {
   getDriveAbout,
   getFileMetadata,
 } from "./google-drive-client";
+import {
+  disconnectSupabaseGoogleAccount,
+  getSupabaseDriveConnectionStatus,
+  getValidSupabaseGoogleAccessToken,
+} from "./google-supabase-token.service";
 
 export const DRIVE_TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000;
 
@@ -320,6 +325,12 @@ function clearDriveTokens(userId: string): void {
  * menos de 5 minutos para expirar (Propriedade 2).
  */
 export async function getValidDriveAccessToken(userId: string): Promise<string> {
+  // Em produção (Vercel) os tokens vivem no Supabase. O repositório JSON é
+  // usado apenas no modo local/demonstração.
+  if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+    return getValidSupabaseGoogleAccessToken(userId);
+  }
+
   const record = getDriveTokenRecord(userId);
   if (!record) {
     throw new ApiError(
@@ -409,18 +420,9 @@ export async function getDriveConnectionStatus(
   userId: string,
   options: { includeStorage?: boolean } = {},
 ): Promise<DriveConnectionStatus> {
-  // O armazenamento de vídeos no Drive ainda não foi migrado para o Supabase.
-  // Enquanto isso, não exibimos o estado antigo do repositório local.
+  // Em produção os tokens e o status vêm do Supabase.
   if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
-    return {
-      connected: false,
-      userEmail: null,
-      driveId: null,
-      expiresAt: null,
-      lastSync: null,
-      scope: null,
-      storage: null,
-    };
+    return getSupabaseDriveConnectionStatus(userId, options);
   }
 
   const record = getDriveTokenRecord(userId);
@@ -466,6 +468,11 @@ export async function disconnectDriveAccount(userId: string): Promise<{
   success: boolean;
   revoked: boolean;
 }> {
+  if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+    const result = await disconnectSupabaseGoogleAccount(userId);
+    return { success: true, revoked: result.revocation_succeeded };
+  }
+
   const record = getDriveTokenRecord(userId);
   if (!record) {
     throw new ApiError(404, "NOT_FOUND", "Nenhuma conta Google Drive conectada");

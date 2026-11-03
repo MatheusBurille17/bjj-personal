@@ -10,8 +10,10 @@ import { ProfileForm } from "@/components/auth/profile-form";
 import { AvatarUpload } from "@/components/auth/avatar-upload";
 import { GoogleAccountSection } from "@/components/account/google-account-section";
 import { GoogleDriveStatus } from "@/components/google-drive/google-drive-status";
-import { getGoogleOAuthStatus } from "@/lib/services/google-auth.service";
-import { getDriveConnectionStatus } from "@/lib/services/google-drive-token.service";
+import {
+  getSupabaseDriveConnectionStatus,
+  getSupabaseGoogleStatus,
+} from "@/lib/services/google-supabase-token.service";
 
 export const metadata: Metadata = { title: "Configurações" };
 export const dynamic = "force-dynamic";
@@ -25,8 +27,8 @@ export default async function SettingsPage({
   const session = await getCurrentSession();
   if (!session) redirect("/login");
   const data = await getProfileView(session.user.id);
-  const googleStatus = getGoogleOAuthStatus(session.user.id);
-  const driveStatus = await getDriveConnectionStatus(session.user.id);
+  const googleStatus = await getSupabaseGoogleStatus(session.user.id);
+  const driveStatus = await getSupabaseDriveConnectionStatus(session.user.id);
 
   return (
     <div>
@@ -92,7 +94,8 @@ export default async function SettingsPage({
             <Alert variant="success">
               <p className="font-medium">Google Drive conectado</p>
               <p className="mt-1 text-xs">
-                A estrutura de pastas foi criada e os vídeos já podem ser enviados.
+                O acesso ao Drive está ativo. A estrutura de pastas é criada no
+                primeiro upload.
               </p>
             </Alert>
           ) : null}
@@ -110,10 +113,10 @@ export default async function SettingsPage({
           />
 
           <Alert>
-            <p className="font-medium">Ambiente de demonstração</p>
+            <p className="font-medium">Conta e dados</p>
             <p className="mt-1 text-xs">
-              Os dados são persistidos localmente em <code>.data/db.json</code>. Em produção, o
-              Supabase Auth e as políticas RLS assumem esta responsabilidade.
+              A autenticação e os dados são gerenciados pelo Supabase
+              (Postgres + Auth + RLS).
             </p>
           </Alert>
         </div>

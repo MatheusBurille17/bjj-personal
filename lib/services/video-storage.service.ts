@@ -28,6 +28,7 @@ import {
   getDriveTokenRecord,
   getValidDriveAccessToken,
 } from "./google-drive-token.service";
+import { getSupabaseDriveRecord } from "./google-supabase-token.service";
 import { validateVideoFile } from "./video-file-validation";
 import { buildPlaybackUrl } from "./playback-token.service";
 
@@ -382,7 +383,9 @@ export async function getVideoPlayback(
 
   if (video.provider === "google_drive") {
     const ownerUserId = video.owner_id ?? video.teacher_id;
-    const ownerToken = getDriveTokenRecord(ownerUserId);
+    const ownerToken = process.env.NEXT_PUBLIC_SUPABASE_URL
+      ? await getSupabaseDriveRecord(ownerUserId)
+      : getDriveTokenRecord(ownerUserId);
     if (!ownerToken) {
       throw new ApiError(
         409,

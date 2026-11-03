@@ -10,9 +10,11 @@ import {
 import { enforceHttpsInProduction } from "@/lib/utils/https";
 import { sanitizeRedirectPath } from "@/lib/utils/url";
 import { getCurrentSession } from "@/lib/auth/session";
-import { consumeOAuthState } from "@/lib/services/oauth-state.service";
-import { completeGoogleAuthorization } from "@/lib/services/google-auth.service";
-import { logOAuthAudit } from "@/lib/services/oauth-audit.service";
+import {
+  completeSupabaseGoogleAuthorization,
+  consumeGoogleOAuthIntent,
+} from "@/lib/services/google-supabase-auth.service";
+import { logOAuthAuditSupabase } from "@/lib/services/oauth-audit-supabase.service";
 import { GoogleOAuthError } from "@/lib/google-oauth-errors";
 
 export const runtime = "nodejs";
@@ -32,6 +34,7 @@ function errorCodeFrom(error: unknown): string {
     if (error.status === 409) return "email_mismatch_on_connect";
     if (error.status === 401) return "unauthorized";
     if (error.status === 404) return "not_found";
+    if (error.status === 403) return "forbidden";
     return "server_error";
   }
   return "server_error";
@@ -41,17 +44,22 @@ function errorRedirect(
   request: Request,
   code: string,
   limit: RateLimitResult,
-  redirectPath?: string,
+  redirectPath: string | undefined,
+  connectMode: boolean,
 ): NextResponse {
   const safePath = sanitizeRedirectPath(redirectPath);
   const isAppArea =
     safePath?.startsWith("/settings") || safePath?.startsWith("/portal");
-  const target = new URL(isAppArea && safePath ? safePath : "/login", request.url);
-  target.searchParams.set("error", code);
-  return applyRateLimitHeaders(
-    NextResponse.redirect(target, 303),
-    limit,
+  // Nesses casos a sessão anterior não existe mais (troca/expiração): mostra o
+  // erro na tela de login, sem cair no redirecionamento do middleware.
+  const forceLogin =
+    code === "email_mismatch_on_connect" || code === "unauthorized";
+  const target = new URL(
+    !forceLogin && connectMode && isAppArea && safePath ? safePath : "/login",
+    request.url,
   );
+  target.searchParams.set("error", code);
+  return applyRateLimitHeaders(NextResponse.redirect(target, 303), limit);
 }
 
 export const GET = route(async (request) => {
@@ -61,93 +69,70 @@ export const GET = route(async (request) => {
   enforceHttpsInProduction(request);
 
   const url = new URL(request.url);
-  const stateParam = url.searchParams.get("state");
-  const stateResult = await consumeOAuthState(stateParam);
+  const code = url.searchParams.get("code");
+  const googleError = url.searchParams.get("error");
+  const intent = await consumeGoogleOAuthIntent();
+  const connectMode = intent?.connect === true;
+  const redirectPath = sanitizeRedirectPath(intent?.next);
   const context = requestContext(request);
 
-  const googleError = url.searchParams.get("error");
   if (googleError) {
-    const code =
+    const reason =
       googleError === "access_denied" ? "access_denied" : "server_error";
-    logOAuthAudit({
+    await logOAuthAuditSupabase({
       event: "google_code_exchange_failed",
       success: false,
       ip: context.ip,
       userAgent: context.userAgent,
-      metadata: { reason: code, google_error: googleError },
+      metadata: {
+        reason,
+        google_error: googleError,
+        connect_mode: connectMode,
+      },
     });
-    return errorRedirect(
-      request,
-      code,
-      limit,
-      stateResult.state?.redirectPath,
-    );
+    return errorRedirect(request, reason, limit, redirectPath, connectMode);
   }
 
-  if (!stateResult.valid || !stateResult.state) {
-    logOAuthAudit({
-      event: "google_state_validation_failed",
-      success: false,
-      ip: context.ip,
-      userAgent: context.userAgent,
-      metadata: { reason: stateResult.reason ?? "state_not_found" },
-    });
-    return errorRedirect(
-      request,
-      stateResult.reason ?? "state_not_found",
-      limit,
-    );
-  }
-
-  const code = url.searchParams.get("code");
   if (!code) {
-    logOAuthAudit({
+    await logOAuthAuditSupabase({
       event: "google_code_exchange_failed",
       success: false,
       ip: context.ip,
       userAgent: context.userAgent,
-      metadata: { reason: "missing_code", connect_mode: stateResult.state.connectMode },
+      metadata: { reason: "missing_code", connect_mode: connectMode },
     });
     return errorRedirect(
       request,
       "invalid_request",
       limit,
-      stateResult.state.redirectPath,
-    );
-  }
-
-  const session = await getCurrentSession();
-
-  if (stateResult.state.connectMode && !session) {
-    return errorRedirect(
-      request,
-      "unauthorized",
-      limit,
-      stateResult.state.redirectPath,
+      redirectPath,
+      connectMode,
     );
   }
 
   try {
-    const result = await completeGoogleAuthorization({
+    const result = await completeSupabaseGoogleAuthorization({
       code,
-      codeVerifier: stateResult.state.codeVerifier,
-      connectMode: stateResult.state.connectMode,
-      currentUserId: session?.user.id ?? null,
+      connectMode,
+      connectEmail: intent?.email ?? null,
+      connectUserId: intent?.userId ?? null,
       context,
     });
 
     const destination =
-      sanitizeRedirectPath(stateResult.state.redirectPath) ??
-      (result.auth.active_role === "teacher" ? "/dashboard" : "/portal");
+      sanitizeRedirectPath(redirectPath) ??
+      (result.activeRole === "teacher" ? "/dashboard" : "/portal");
     const target = new URL(destination, request.url);
-    if (stateResult.state.connectMode) {
+    if (connectMode) {
       target.searchParams.set("google", "connected");
     }
 
     return applyRateLimitHeaders(NextResponse.redirect(target, 303), limit);
   } catch (error) {
     const reason = errorCodeFrom(error);
-    logOAuthAudit({
+    const session = await getCurrentSession().catch(() => null);
+
+    await logOAuthAuditSupabase({
       event: "google_code_exchange_failed",
       userId: session?.user.id ?? null,
       success: false,
@@ -155,15 +140,10 @@ export const GET = route(async (request) => {
       userAgent: context.userAgent,
       metadata: {
         reason,
-        connect_mode: stateResult.state.connectMode,
+        connect_mode: connectMode,
       },
     });
 
-    const fallbackPath = stateResult.state.connectMode
-      ? stateResult.state.redirectPath ??
-        (session?.activeRole === "teacher" ? "/settings" : "/portal/profile")
-      : stateResult.state.redirectPath;
-
-    return errorRedirect(request, reason, limit, fallbackPath);
+    return errorRedirect(request, reason, limit, redirectPath, connectMode);
   }
 });

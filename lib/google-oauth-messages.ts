@@ -9,6 +9,8 @@ const MESSAGES: Record<string, string> = {
     "Este e-mail já está vinculado a outra conta Google. Entre com a conta correta.",
   email_mismatch_on_connect:
     "O e-mail da conta Google não corresponde ao e-mail da sua conta. Entre com a conta Google correta.",
+  forbidden:
+    "Sua conta ainda não possui um vínculo ativo. Aceite o convite do seu professor para acessar o portal.",
   https_required: "Conexão insegura. Acesse a plataforma usando HTTPS.",
   invalid_client: "A configuração do cliente Google é inválida. Contate o suporte.",
   invalid_code:
@@ -28,6 +30,8 @@ const MESSAGES: Record<string, string> = {
   state_not_found: "Solicitação de autenticação inválida. Comece novamente.",
   token_refresh_failed:
     "Sua conexão com o Google expirou. Reconecte sua conta Google.",
+  token_storage_failed:
+    "Não foi possível salvar os tokens do Google. Tente conectar novamente.",
   unauthorized: "Sua sessão expirou. Entre novamente.",
 };
 
