@@ -20,14 +20,16 @@ export default async function PlanDetailPage({
   const { id } = await params;
 
   try {
-    const plan = getPlanDetail(id, session.user.id);
-    const enrollments = getEnrollments(session.user.id, {
-      search: "",
-      status: ["active", "paused"],
-      page: 1,
-      pageSize: 100,
-    }).enrollments;
-    const library = getLibraryTree(session.user.id);
+    const plan = await getPlanDetail(id, session.user.id);
+    const enrollments = (
+      await getEnrollments(session.user.id, {
+        search: "",
+        status: ["active", "paused"],
+        page: 1,
+        pageSize: 100,
+      })
+    ).enrollments;
+    const library = await getLibraryTree(session.user.id);
 
     return (
       <PlanDetailView

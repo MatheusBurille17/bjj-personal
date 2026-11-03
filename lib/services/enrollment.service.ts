@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type {
   Enrollment,
   EnrollmentDetail,
@@ -8,14 +7,17 @@ import type {
   NextLessonInfo,
 } from "@/types/enrollment";
 import type { EnrollmentStatus } from "@/types/enrollment";
-import { getDb, mutate, nowIso } from "@/lib/db/store";
-import { ApiError, buildPagination, paginate } from "@/lib/middleware/errors";
+import { ApiError, buildPagination } from "@/lib/middleware/errors";
 import type {
   CreateEnrollmentInput,
   SearchEnrollmentsInput,
   UpdateEnrollmentInput,
 } from "@/lib/validation/enrollment";
 import { validateStatusTransition } from "@/lib/validation/enrollment";
+import { createClient } from "@/lib/supabase/server";
+import { mapPostgrestError, unwrapMaybe, unwrapVoid } from "@/lib/supabase/errors";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Database } from "@/lib/supabase/database";
 import {
   buildInviteUrl,
   generateInviteToken,
@@ -23,15 +25,44 @@ import {
   sendInvitationEmail,
 } from "./invitation.service";
 
-function nextScheduledLesson(enrollmentId: string): NextLessonInfo | null {
-  const db = getDb();
+type Client = SupabaseClient<Database>;
+
+interface LessonAggregate {
+  enrollment_id: string;
+  status: string;
+  starts_at: string;
+  ends_at: string;
+  id: string;
+  title_snapshot: string | null;
+}
+
+async function loadLessonAggregates(
+  supabase: Client,
+  enrollmentIds: string[],
+): Promise<Map<string, LessonAggregate[]>> {
+  const grouped = new Map<string, LessonAggregate[]>();
+  if (enrollmentIds.length === 0) return grouped;
+
+  const { data, error } = await supabase
+    .from("lessons")
+    .select("id, enrollment_id, status, starts_at, ends_at, title_snapshot")
+    .in("enrollment_id", enrollmentIds);
+
+  if (error) throw mapPostgrestError(error);
+
+  for (const lesson of data ?? []) {
+    const list = grouped.get(lesson.enrollment_id) ?? [];
+    list.push(lesson);
+    grouped.set(lesson.enrollment_id, list);
+  }
+  return grouped;
+}
+
+function nextScheduledLesson(lessons: LessonAggregate[] | undefined): NextLessonInfo | null {
   const now = Date.now();
-  const lesson = db.lessons
+  const lesson = (lessons ?? [])
     .filter(
-      (item) =>
-        item.enrollment_id === enrollmentId &&
-        item.status === "scheduled" &&
-        new Date(item.starts_at).getTime() >= now,
+      (item) => item.status === "scheduled" && new Date(item.starts_at).getTime() >= now,
     )
     .sort((a, b) => a.starts_at.localeCompare(b.starts_at))[0];
 
@@ -45,13 +76,14 @@ function nextScheduledLesson(enrollmentId: string): NextLessonInfo | null {
   };
 }
 
-function completedCount(enrollmentId: string): number {
-  return getDb().lessons.filter(
-    (item) => item.enrollment_id === enrollmentId && item.status === "completed",
-  ).length;
+function completedCount(lessons: LessonAggregate[] | undefined): number {
+  return (lessons ?? []).filter((item) => item.status === "completed").length;
 }
 
-export function toEnrollmentListItem(enrollment: Enrollment): EnrollmentListItem {
+export function toEnrollmentListItem(
+  enrollment: Enrollment,
+  lessons?: LessonAggregate[],
+): EnrollmentListItem {
   return {
     id: enrollment.id,
     student_name: enrollment.student_name,
@@ -61,14 +93,25 @@ export function toEnrollmentListItem(enrollment: Enrollment): EnrollmentListItem
     started_at: enrollment.started_at,
     archived_at: enrollment.archived_at,
     invite_expires_at: enrollment.invite_expires_at,
-    next_lesson: nextScheduledLesson(enrollment.id),
-    completed_lessons_count: completedCount(enrollment.id),
+    next_lesson: nextScheduledLesson(lessons),
+    completed_lessons_count: completedCount(lessons),
   };
 }
 
 /** Busca um vínculo garantindo que pertence ao professor autenticado. */
-export function getOwnedEnrollment(enrollmentId: string, teacherId: string): Enrollment {
-  const enrollment = getDb().enrollments.find((item) => item.id === enrollmentId);
+export async function getOwnedEnrollment(
+  enrollmentId: string,
+  teacherId: string,
+): Promise<Enrollment> {
+  const supabase = await createClient();
+  const enrollment = unwrapMaybe(
+    await supabase
+      .from("teacher_enrollments")
+      .select("*")
+      .eq("id", enrollmentId)
+      .maybeSingle(),
+  );
+
   if (!enrollment) throw ApiError.notFound("Aluno não encontrado");
   if (enrollment.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
   return enrollment;
@@ -76,21 +119,24 @@ export function getOwnedEnrollment(enrollmentId: string, teacherId: string): Enr
 
 /**
  * Cria um vínculo pendente, gera token de convite e envia o e-mail.
- * Requisitos 1.1-1.9, 13.1-13.7.
  */
 export async function createEnrollment(
   teacherId: string,
   data: CreateEnrollmentInput,
 ): Promise<{ enrollment: Enrollment; invite_url: string }> {
-  const db = getDb();
+  const supabase = await createClient();
   const email = data.student_email.toLowerCase();
-  const duplicate = db.enrollments.some(
-    (item) =>
-      item.teacher_id === teacherId &&
-      item.student_email.toLowerCase() === email &&
-      (item.status === "active" || item.status === "pending"),
-  );
 
+  const { data: duplicate, error: duplicateError } = await supabase
+    .from("enrollments")
+    .select("id")
+    .eq("teacher_id", teacherId)
+    .ilike("student_email", email)
+    .in("status", ["active", "pending"])
+    .limit(1)
+    .maybeSingle();
+
+  if (duplicateError) throw mapPostgrestError(duplicateError);
   if (duplicate) {
     throw new ApiError(
       409,
@@ -100,219 +146,266 @@ export async function createEnrollment(
   }
 
   const token = generateInviteToken();
-  const timestamp = nowIso();
-  const enrollment: Enrollment = {
-    id: randomUUID(),
-    teacher_id: teacherId,
-    student_profile_id: null,
-    student_name: data.student_name,
-    student_email: email,
-    student_phone: data.student_phone ?? null,
-    status: "pending",
-    started_at: data.started_at ?? timestamp,
-    archived_at: null,
-    private_notes: data.private_notes ?? null,
-    invite_token: token,
-    invite_expires_at: inviteExpiration(),
-    created_at: timestamp,
-    updated_at: timestamp,
-  };
+  const inserted = await supabase
+    .from("enrollments")
+    .insert({
+      teacher_id: teacherId,
+      student_profile_id: null,
+      student_name: data.student_name,
+      student_email: email,
+      student_phone: data.student_phone ?? null,
+      status: "pending",
+      started_at: data.started_at ?? new Date().toISOString(),
+      archived_at: null,
+      private_notes: data.private_notes ?? null,
+      invite_token: token,
+      invite_expires_at: inviteExpiration(),
+    })
+    .select("id")
+    .single();
 
-  mutate((database) => {
-    database.enrollments.push(enrollment);
-  });
+  if (inserted.error) throw mapPostgrestError(inserted.error);
 
+  const enrollment = await getOwnedEnrollment(inserted.data.id, teacherId);
   await sendInvitationEmail(enrollment, token);
   return { enrollment, invite_url: buildInviteUrl(token) };
 }
 
-/** Lista vínculos com busca, filtros e paginação (Requisitos 2-4, 20). */
-export function getEnrollments(
+/** Lista vínculos com busca, filtros e paginação. */
+export async function getEnrollments(
   teacherId: string,
   options: SearchEnrollmentsInput,
-): EnrollmentListResponse {
-  const db = getDb();
-  const statuses =
+): Promise<EnrollmentListResponse> {
+  const supabase = await createClient();
+  const statuses: EnrollmentStatus[] =
     options.status.length > 0
       ? options.status
       : (["active", "paused"] as EnrollmentStatus[]);
 
-  const search = options.search.trim().toLowerCase();
-  let items = db.enrollments.filter((item) => item.teacher_id === teacherId);
+  const page = Math.max(1, options.page);
+  const pageSize = Math.min(Math.max(1, options.pageSize), 100);
+  const from = (page - 1) * pageSize;
+  const to = from + pageSize - 1;
+
+  let query = supabase
+    .from("teacher_enrollments")
+    .select("*", { count: "exact" })
+    .order("student_name", { ascending: true })
+    .range(from, to);
 
   if (!options.status.includes("archived")) {
-    items = items.filter((item) => item.status !== "archived");
+    query = query.neq("status", "archived");
   }
-  items = items.filter((item) => statuses.includes(item.status));
+  query = query.in("status", statuses);
 
+  const search = options.search.trim();
   if (search) {
-    items = items.filter((item) => item.student_name.toLowerCase().includes(search));
+    query = query.ilike("student_name", `%${search}%`);
   }
 
-  items = items.sort((a, b) => a.student_name.localeCompare(b.student_name, "pt-BR"));
+  const { data, error, count } = await query;
+  if (error) throw mapPostgrestError(error);
 
-  const filtered = items.map(toEnrollmentListItem);
-  const paginated = paginate(filtered, options.page, options.pageSize);
-
-  return {
-    enrollments: paginated,
-    pagination: buildPagination(filtered.length, options.page, options.pageSize),
-  };
-}
-
-/** Detalhe do vínculo com estatísticas (Requisito 5). */
-export function getEnrollmentDetail(
-  enrollmentId: string,
-  teacherId: string,
-): EnrollmentDetail {
-  const enrollment = getOwnedEnrollment(enrollmentId, teacherId);
-  const lessons = getDb().lessons.filter((item) => item.enrollment_id === enrollmentId);
-  const scheduled = lessons.filter((item) => item.status === "scheduled").length;
-  const completed = lessons.filter((item) => item.status === "completed").length;
-  const durationDays = Math.max(
-    0,
-    Math.floor((Date.now() - new Date(enrollment.started_at).getTime()) / (24 * 60 * 60 * 1000)),
+  const enrollments = (data ?? []) as Enrollment[];
+  const aggregates = await loadLessonAggregates(
+    supabase,
+    enrollments.map((item) => item.id),
   );
 
   return {
-    ...toEnrollmentListItem(enrollment),
+    enrollments: enrollments.map((item) =>
+      toEnrollmentListItem(item, aggregates.get(item.id)),
+    ),
+    pagination: buildPagination(count ?? 0, page, pageSize),
+  };
+}
+
+/** Detalhe do vínculo com estatísticas. */
+export async function getEnrollmentDetail(
+  enrollmentId: string,
+  teacherId: string,
+): Promise<EnrollmentDetail> {
+  const enrollment = await getOwnedEnrollment(enrollmentId, teacherId);
+  const supabase = await createClient();
+  const aggregates = await loadLessonAggregates(supabase, [enrollmentId]);
+  const lessons = aggregates.get(enrollmentId) ?? [];
+
+  const durationDays = Math.max(
+    0,
+    Math.floor(
+      (Date.now() - new Date(enrollment.started_at).getTime()) / (24 * 60 * 60 * 1000),
+    ),
+  );
+
+  return {
+    ...toEnrollmentListItem(enrollment, lessons),
     private_notes: enrollment.private_notes,
     lessons_count: lessons.length,
-    completed_lessons_count: completed,
-    scheduled_lessons_count: scheduled,
+    completed_lessons_count: lessons.filter((item) => item.status === "completed").length,
+    scheduled_lessons_count: lessons.filter((item) => item.status === "scheduled").length,
     duration_days: durationDays,
   };
 }
 
-/** Atualiza dados cadastrais, sem alterar status (Requisito 6). */
-export function updateEnrollment(
+/** Atualiza dados cadastrais, sem alterar status. */
+export async function updateEnrollment(
   enrollmentId: string,
   teacherId: string,
   data: UpdateEnrollmentInput,
-): Enrollment {
-  const current = getOwnedEnrollment(enrollmentId, teacherId);
+): Promise<Enrollment> {
+  const current = await getOwnedEnrollment(enrollmentId, teacherId);
+  const supabase = await createClient();
   const email = data.student_email?.toLowerCase();
 
   if (email && email !== current.student_email.toLowerCase()) {
-    const duplicate = getDb().enrollments.some(
-      (item) =>
-        item.id !== enrollmentId &&
-        item.teacher_id === teacherId &&
-        item.student_email.toLowerCase() === email &&
-        (item.status === "active" || item.status === "pending"),
-    );
+    const { data: duplicate, error } = await supabase
+      .from("enrollments")
+      .select("id")
+      .neq("id", enrollmentId)
+      .eq("teacher_id", teacherId)
+      .ilike("student_email", email)
+      .in("status", ["active", "pending"])
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw mapPostgrestError(error);
     if (duplicate) {
-      throw new ApiError(409, "CONFLICT", "Já existe um vínculo ativo ou pendente para este e-mail");
+      throw new ApiError(
+        409,
+        "CONFLICT",
+        "Já existe um vínculo ativo ou pendente para este e-mail",
+      );
     }
   }
 
-  return mutate((db) => {
-    const enrollment = db.enrollments.find((item) => item.id === enrollmentId);
-    if (!enrollment) throw ApiError.notFound("Aluno não encontrado");
+  const payload: {
+    student_name?: string;
+    student_email?: string;
+    student_phone?: string | null;
+    private_notes?: string | null;
+  } = {};
+  if (data.student_name !== undefined) payload.student_name = data.student_name;
+  if (email !== undefined) payload.student_email = email;
+  if (data.student_phone !== undefined) payload.student_phone = data.student_phone;
+  if (data.private_notes !== undefined) payload.private_notes = data.private_notes;
 
-    if (data.student_name !== undefined) enrollment.student_name = data.student_name;
-    if (email !== undefined) enrollment.student_email = email;
-    if (data.student_phone !== undefined) enrollment.student_phone = data.student_phone;
-    if (data.private_notes !== undefined) enrollment.private_notes = data.private_notes;
-    enrollment.updated_at = nowIso();
-    return { ...enrollment };
-  });
+  unwrapVoid(
+    await supabase.from("enrollments").update(payload).eq("id", enrollmentId),
+  );
+
+  return getOwnedEnrollment(enrollmentId, teacherId);
 }
 
-function changeStatus(
+async function changeStatus(
   enrollmentId: string,
   teacherId: string,
   target: EnrollmentStatus,
-  extra?: (enrollment: Enrollment) => void,
-): Enrollment {
-  const enrollment = getOwnedEnrollment(enrollmentId, teacherId);
+  extra?: { archived_at?: string | null },
+): Promise<Enrollment> {
+  const enrollment = await getOwnedEnrollment(enrollmentId, teacherId);
   const transition = validateStatusTransition(enrollment.status, target);
   if (!transition.valid) {
     throw new ApiError(409, "CONFLICT", transition.message);
   }
 
-  return mutate((db) => {
-    const record = db.enrollments.find((item) => item.id === enrollmentId);
-    if (!record) throw ApiError.notFound("Aluno não encontrado");
-    record.status = target;
-    record.updated_at = nowIso();
-    extra?.(record);
-    return { ...record };
-  });
+  const supabase = await createClient();
+  unwrapVoid(
+    await supabase
+      .from("enrollments")
+      .update({ status: target, ...extra })
+      .eq("id", enrollmentId),
+  );
+
+  return getOwnedEnrollment(enrollmentId, teacherId);
 }
 
-export function pauseEnrollment(enrollmentId: string, teacherId: string): Enrollment {
-  const enrollment = getOwnedEnrollment(enrollmentId, teacherId);
+export async function pauseEnrollment(
+  enrollmentId: string,
+  teacherId: string,
+): Promise<Enrollment> {
+  const enrollment = await getOwnedEnrollment(enrollmentId, teacherId);
   if (enrollment.status !== "active") {
     throw new ApiError(409, "CONFLICT", "Apenas vínculos ativos podem ser pausados");
   }
   return changeStatus(enrollmentId, teacherId, "paused");
 }
 
-export function reactivateEnrollment(enrollmentId: string, teacherId: string): Enrollment {
-  const enrollment = getOwnedEnrollment(enrollmentId, teacherId);
+export async function reactivateEnrollment(
+  enrollmentId: string,
+  teacherId: string,
+): Promise<Enrollment> {
+  const enrollment = await getOwnedEnrollment(enrollmentId, teacherId);
   if (enrollment.status !== "paused") {
     throw new ApiError(409, "CONFLICT", "Apenas vínculos pausados podem ser reativados");
   }
   return changeStatus(enrollmentId, teacherId, "active");
 }
 
-export function archiveEnrollment(enrollmentId: string, teacherId: string): Enrollment {
-  const enrollment = getOwnedEnrollment(enrollmentId, teacherId);
+export async function archiveEnrollment(
+  enrollmentId: string,
+  teacherId: string,
+): Promise<Enrollment> {
+  const enrollment = await getOwnedEnrollment(enrollmentId, teacherId);
   if (enrollment.status === "archived") {
     throw new ApiError(409, "CONFLICT", "Este vínculo já está arquivado");
   }
-  return changeStatus(enrollmentId, teacherId, "archived", (record) => {
-    record.archived_at = nowIso();
+  return changeStatus(enrollmentId, teacherId, "archived", {
+    archived_at: new Date().toISOString(),
   });
 }
 
-/** Verifica se o vínculo pode ser excluído (Requisito 10). */
-export function canDeleteEnrollment(enrollmentId: string): boolean {
-  return !getDb().lessons.some((lesson) => lesson.enrollment_id === enrollmentId);
+/** Verifica se o vínculo pode ser excluído. */
+export async function canDeleteEnrollment(enrollmentId: string): Promise<boolean> {
+  const supabase = await createClient();
+  const { count, error } = await supabase
+    .from("lessons")
+    .select("id", { count: "exact", head: true })
+    .eq("enrollment_id", enrollmentId);
+
+  if (error) throw mapPostgrestError(error);
+  return (count ?? 0) === 0;
 }
 
-export function deleteEnrollment(enrollmentId: string, teacherId: string): void {
-  getOwnedEnrollment(enrollmentId, teacherId);
-  if (!canDeleteEnrollment(enrollmentId)) {
+export async function deleteEnrollment(
+  enrollmentId: string,
+  teacherId: string,
+): Promise<void> {
+  await getOwnedEnrollment(enrollmentId, teacherId);
+  if (!(await canDeleteEnrollment(enrollmentId))) {
     throw new ApiError(
       409,
       "CONFLICT",
       "Este aluno possui histórico de aulas e não pode ser excluído. Arquive o vínculo para preservar o histórico.",
     );
   }
-  mutate((db) => {
-    db.enrollments = db.enrollments.filter((item) => item.id !== enrollmentId);
-    db.plan_enrollments = db.plan_enrollments.filter((item) => item.enrollment_id !== enrollmentId);
-    db.student_technique_access = db.student_technique_access.filter(
-      (item) => item.enrollment_id !== enrollmentId,
-    );
-    db.weekly_slots = db.weekly_slots.filter((item) => item.enrollment_id !== enrollmentId);
-  });
+
+  const supabase = await createClient();
+  unwrapVoid(await supabase.from("enrollments").delete().eq("id", enrollmentId));
 }
 
-/** Reenvia o convite, invalidando o token anterior (Requisito 11). */
+/** Reenvia o convite, invalidando o token anterior. */
 export async function resendInvitation(
   enrollmentId: string,
   teacherId: string,
 ): Promise<InviteResendResult> {
-  const enrollment = getOwnedEnrollment(enrollmentId, teacherId);
+  const enrollment = await getOwnedEnrollment(enrollmentId, teacherId);
   if (enrollment.status !== "pending") {
     throw new ApiError(409, "CONFLICT", "Somente convites pendentes podem ser reenviados");
   }
 
   const token = generateInviteToken();
   const expiresAt = inviteExpiration();
-  const updated = mutate((db) => {
-    const record = db.enrollments.find((item) => item.id === enrollmentId);
-    if (!record) throw ApiError.notFound("Aluno não encontrado");
-    record.invite_token = token;
-    record.invite_expires_at = expiresAt;
-    record.updated_at = nowIso();
-    return { ...record };
-  });
+  const supabase = await createClient();
+  unwrapVoid(
+    await supabase
+      .from("enrollments")
+      .update({ invite_token: token, invite_expires_at: expiresAt })
+      .eq("id", enrollmentId),
+  );
 
+  const updated = await getOwnedEnrollment(enrollmentId, teacherId);
   await sendInvitationEmail(updated, token);
+
   return {
     enrollment_id: enrollmentId,
     invite_token: token,
@@ -322,10 +415,16 @@ export async function resendInvitation(
 }
 
 /** Retorna todos os vínculos ativos de um aluno (visão do portal). */
-export function getStudentEnrollments(studentId: string): Enrollment[] {
-  return getDb()
-    .enrollments.filter(
-      (item) => item.student_profile_id === studentId && item.status !== "archived",
-    )
-    .sort((a, b) => a.started_at.localeCompare(b.started_at));
+export async function getStudentEnrollments(studentId: string): Promise<Enrollment[]> {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("student_enrollments")
+    .select("*")
+    .eq("student_profile_id", studentId)
+    .neq("status", "archived")
+    .order("started_at", { ascending: true });
+
+  if (error) throw mapPostgrestError(error);
+
+  return (data ?? []).map((row) => ({ ...row, private_notes: null })) as Enrollment[];
 }

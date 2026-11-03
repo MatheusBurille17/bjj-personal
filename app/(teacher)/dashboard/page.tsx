@@ -25,7 +25,7 @@ export const dynamic = "force-dynamic";
 export default async function TeacherDashboardPage() {
   const session = await getCurrentSession();
   if (!session) return null;
-  const dashboard = getTeacherDashboard(session.user.id);
+  const dashboard = await getTeacherDashboard(session.user.id);
 
   return (
     <div>

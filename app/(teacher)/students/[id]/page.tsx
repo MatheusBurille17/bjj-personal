@@ -20,17 +20,21 @@ export default async function StudentDetailPage({
   const { id } = await params;
 
   try {
-    const enrollment = getEnrollmentDetail(id, session.user.id);
-    const lessons = getLessons(session.user.id, {
-      enrollment_id: id,
-      pageSize: 100,
-    }).lessons;
-    const access = getAccessForEnrollment(id, session.user.id);
-    const techniques = getTechniques(session.user.id, {
-      includeArchived: true,
-      pageSize: 100,
-    }).techniques;
-    const weeklySlots = getWeeklySlots(session.user.id, id);
+    const enrollment = await getEnrollmentDetail(id, session.user.id);
+    const lessons = (
+      await getLessons(session.user.id, {
+        enrollment_id: id,
+        pageSize: 100,
+      })
+    ).lessons;
+    const access = await getAccessForEnrollment(id, session.user.id);
+    const techniques = (
+      await getTechniques(session.user.id, {
+        includeArchived: true,
+        pageSize: 100,
+      })
+    ).techniques;
+    const weeklySlots = await getWeeklySlots(session.user.id, id);
 
     return (
       <StudentDetailView

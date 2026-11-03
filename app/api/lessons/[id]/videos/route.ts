@@ -13,12 +13,12 @@ export const runtime = "nodejs";
 export const GET = route<{ id: string }>(async (_request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
-  return jsonSuccess(getLessonDetail(id, session.user.id).videos);
+  return jsonSuccess((await getLessonDetail(id, session.user.id)).videos);
 });
 
 export const POST = route<{ id: string }>(async (request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
   const data = lessonVideoSchema.parse(await parseJson(request));
-  return jsonCreated(addLessonVideo(id, session.user.id, data.video_id, data.sort_order));
+  return jsonCreated(await addLessonVideo(id, session.user.id, data.video_id, data.sort_order));
 });

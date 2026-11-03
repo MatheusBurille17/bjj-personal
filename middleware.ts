@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
-import { SESSION_COOKIE, verifySessionToken } from "@/lib/auth/token";
+import { createServerClient } from "@supabase/ssr";
+import { ACTIVE_ROLE_COOKIE } from "@/lib/auth/constants";
 
 const PUBLIC_PAGES = ["/login", "/signup", "/recover", "/reset-password"];
 const TEACHER_PREFIXES = ["/dashboard", "/students", "/plans", "/schedule", "/library", "/settings"];
@@ -19,6 +20,10 @@ function isPublic(pathname: string): boolean {
   return false;
 }
 
+function homeFor(role: string | undefined): string {
+  return role === "student" ? "/portal" : "/dashboard";
+}
+
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
@@ -26,18 +31,49 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next();
   }
 
-  const token = request.cookies.get(SESSION_COOKIE)?.value;
-  const session = await verifySessionToken(token);
+  let response = NextResponse.next({ request });
 
-  if (isPublic(pathname)) {
-    // Usuário autenticado não precisa ver login/cadastro; recuperação continua acessível.
-    if (session && (pathname === "/login" || pathname === "/signup")) {
-      return NextResponse.redirect(new URL(session.role === "teacher" ? "/dashboard" : "/portal", request.url));
-    }
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const publicKey =
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ??
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  if (!url || !publicKey) {
     return NextResponse.next();
   }
 
-  if (!session) {
+  const supabase = createServerClient(url, publicKey, {
+    cookies: {
+      getAll() {
+        return request.cookies.getAll();
+      },
+      setAll(cookiesToSet) {
+        for (const { name, value } of cookiesToSet) {
+          request.cookies.set(name, value);
+        }
+        response = NextResponse.next({ request });
+        for (const { name, value, options } of cookiesToSet) {
+          response.cookies.set(name, value, options);
+        }
+      },
+    },
+  });
+
+  // Valida/renova a sessão. Não troque por getSession(): getUser() valida no servidor.
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  const activeRole = request.cookies.get(ACTIVE_ROLE_COOKIE)?.value;
+
+  if (isPublic(pathname)) {
+    if (user && (pathname === "/login" || pathname === "/signup")) {
+      return NextResponse.redirect(new URL(homeFor(activeRole), request.url));
+    }
+    return response;
+  }
+
+  if (!user) {
     if (pathname.startsWith("/api/")) {
       return NextResponse.json(
         { data: null, error: { code: "UNAUTHORIZED", message: "Autenticação necessária" } },
@@ -56,21 +92,29 @@ export async function middleware(request: NextRequest) {
     (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
   );
 
-  if (isTeacherPath && session.role !== "teacher") {
-    return NextResponse.redirect(new URL("/portal", request.url));
-  }
-  if (isStudentPath && session.role !== "student") {
-    return NextResponse.redirect(new URL("/dashboard", request.url));
-  }
-  if (pathname === "/") {
-    return NextResponse.redirect(
-      new URL(session.role === "teacher" ? "/dashboard" : "/portal", request.url),
-    );
+  // O cookie é apenas uma dica de navegação; a autorização real é revalidada
+  // nos layouts e em cada rota/servidor.
+  if (activeRole) {
+    if (isTeacherPath && activeRole !== "teacher") {
+      return NextResponse.redirect(new URL("/portal", request.url));
+    }
+    if (isStudentPath && activeRole !== "student") {
+      return NextResponse.redirect(new URL("/dashboard", request.url));
+    }
   }
 
-  return NextResponse.next();
+  if (pathname === "/") {
+    return NextResponse.redirect(new URL(homeFor(activeRole), request.url));
+  }
+
+  return response;
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
+  // Uploads grandes não passam pelo middleware: o limite de corpo do
+  // middleware (10MB) truncaria arquivos de vídeo. A autenticação é feita
+  // dentro das próprias rotas de upload.
+  matcher: [
+    "/((?!_next/static|_next/image|favicon.ico|api/videos/upload|api/google-drive/upload).*)",
+  ],
 };

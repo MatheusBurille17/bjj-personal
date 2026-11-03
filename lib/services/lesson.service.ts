@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type {
   CreateLessonData,
   CreateWeeklySlotData,
@@ -16,8 +15,7 @@ import type {
   WeeklySlotWithStudent,
 } from "@/types/lesson";
 import type { PlanDay } from "@/types/plan";
-import { getDb, mutate, nowIso } from "@/lib/db/store";
-import { ApiError, buildPagination, paginate } from "@/lib/middleware/errors";
+import { ApiError, buildPagination } from "@/lib/middleware/errors";
 import {
   addDays,
   dateKey,
@@ -25,63 +23,76 @@ import {
   startOfDayIso,
   startOfWeek,
 } from "@/lib/utils/date";
+import { createClient } from "@/lib/supabase/server";
+import { mapPostgrestError, unwrapMaybe, unwrapVoid } from "@/lib/supabase/errors";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Database } from "@/lib/supabase/database";
+
+type Client = SupabaseClient<Database>;
 
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                     */
 /* -------------------------------------------------------------------------- */
 
-function ownedLesson(lessonId: string, teacherId: string): Lesson {
-  const lesson = getDb().lessons.find((item) => item.id === lessonId);
-  if (!lesson) throw ApiError.notFound("Aula não encontrada");
-  if (lesson.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
-  return lesson;
+interface LessonContext {
+  enrollments: Map<string, { student_name: string; student_email: string; status: string }>;
+  planDays: Map<string, PlanDay>;
+  videoCounts: Map<string, number>;
 }
 
-function enrollmentForTeacher(enrollmentId: string, teacherId: string) {
-  const enrollment = getDb().enrollments.find((item) => item.id === enrollmentId);
-  if (!enrollment) throw ApiError.notFound("Aluno não encontrado");
-  if (enrollment.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
-  return enrollment;
+async function loadLessonContext(
+  supabase: Client,
+  lessons: Lesson[],
+): Promise<LessonContext> {
+  const enrollmentIds = Array.from(new Set(lessons.map((lesson) => lesson.enrollment_id)));
+  const planDayIds = Array.from(
+    new Set(lessons.map((lesson) => lesson.plan_day_id).filter((id): id is string => Boolean(id))),
+  );
+  const lessonIds = lessons.map((lesson) => lesson.id);
+
+  const [enrollments, planDays, videos] = await Promise.all([
+    enrollmentIds.length > 0
+      ? supabase
+          .from("enrollments")
+          .select("id, student_name, student_email, status")
+          .in("id", enrollmentIds)
+      : Promise.resolve({ data: [], error: null }),
+    planDayIds.length > 0
+      ? supabase.from("plan_days").select("*").in("id", planDayIds)
+      : Promise.resolve({ data: [], error: null }),
+    lessonIds.length > 0
+      ? supabase.from("lesson_videos").select("lesson_id").in("lesson_id", lessonIds)
+      : Promise.resolve({ data: [], error: null }),
+  ]);
+
+  if (enrollments.error) throw mapPostgrestError(enrollments.error);
+  if (planDays.error) throw mapPostgrestError(planDays.error);
+  if (videos.error) throw mapPostgrestError(videos.error);
+
+  const videoCounts = new Map<string, number>();
+  for (const item of videos.data ?? []) {
+    videoCounts.set(item.lesson_id, (videoCounts.get(item.lesson_id) ?? 0) + 1);
+  }
+
+  return {
+    enrollments: new Map(
+      (enrollments.data ?? []).map((item) => [
+        item.id,
+        {
+          student_name: item.student_name,
+          student_email: item.student_email,
+          status: item.status,
+        },
+      ]),
+    ),
+    planDays: new Map((planDays.data ?? []).map((item) => [item.id, item])),
+    videoCounts,
+  };
 }
 
-function planDayForTeacher(planDayId: string, teacherId: string): { day: PlanDay; planStatus: string } {
-  const db = getDb();
-  const day = db.plan_days.find((item) => item.id === planDayId);
-  if (!day) throw ApiError.notFound("Dia do plano não encontrado");
-  const plan = db.monthly_plans.find((item) => item.id === day.monthly_plan_id);
-  if (!plan) throw ApiError.notFound("Plano não encontrado");
-  if (plan.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
-  if (plan.status === "archived") throw ApiError.conflict("Não é possível usar um dia de plano arquivado");
-  return { day, planStatus: plan.status };
-}
-
-/** Detecta sobreposição com outras aulas agendadas do mesmo professor. */
-export function detectConflicts(
-  teacherId: string,
-  startsAt: string,
-  endsAt: string,
-  excludeLessonId?: string,
-): LessonListItem[] {
-  const start = new Date(startsAt).getTime();
-  const end = new Date(endsAt).getTime();
-  return getDb()
-    .lessons.filter(
-      (lesson) =>
-        lesson.teacher_id === teacherId &&
-        lesson.status === "scheduled" &&
-        lesson.id !== excludeLessonId &&
-        new Date(lesson.starts_at).getTime() < end &&
-        new Date(lesson.ends_at).getTime() > start,
-    )
-    .map(toLessonListItem);
-}
-
-export function toLessonListItem(lesson: Lesson): LessonListItem {
-  const db = getDb();
-  const enrollment = db.enrollments.find((item) => item.id === lesson.enrollment_id);
-  const planDay = lesson.plan_day_id
-    ? db.plan_days.find((item) => item.id === lesson.plan_day_id)
-    : undefined;
+function withContext(lesson: Lesson, context: LessonContext): LessonListItem {
+  const enrollment = context.enrollments.get(lesson.enrollment_id);
+  const planDay = lesson.plan_day_id ? context.planDays.get(lesson.plan_day_id) : undefined;
 
   return {
     ...lesson,
@@ -89,36 +100,153 @@ export function toLessonListItem(lesson: Lesson): LessonListItem {
     student_email: enrollment?.student_email ?? "",
     enrollment_status: enrollment?.status ?? "archived",
     plan_day_title: planDay?.title ?? lesson.title_snapshot,
-    video_count: db.lesson_videos.filter((item) => item.lesson_id === lesson.id).length,
+    video_count: context.videoCounts.get(lesson.id) ?? 0,
   };
 }
 
-function lessonVideos(lessonId: string): LessonVideoWithVideo[] {
-  const db = getDb();
-  return db.lesson_videos
-    .filter((item) => item.lesson_id === lessonId)
-    .sort((a, b) => a.sort_order - b.sort_order)
-    .map((association) => {
-      const video = db.videos.find((item) => item.id === association.video_id);
-      if (!video) return null;
-      return { ...association, video };
-    })
-    .filter((item): item is LessonVideoWithVideo => Boolean(item));
+async function enrichLessons(lessons: Lesson[]): Promise<LessonListItem[]> {
+  if (lessons.length === 0) return [];
+  const supabase = await createClient();
+  const context = await loadLessonContext(supabase, lessons);
+  return lessons.map((lesson) => withContext(lesson, context));
 }
 
-export function getLessonDetail(lessonId: string, teacherId: string): LessonDetail {
-  const lesson = ownedLesson(lessonId, teacherId);
-  const db = getDb();
-  const planDay = lesson.plan_day_id
-    ? db.plan_days.find((item) => item.id === lesson.plan_day_id) ?? null
-    : null;
-  const teacher = db.teachers.find((item) => item.id === teacherId);
+export function toLessonListItem(lesson: Lesson): LessonListItem {
+  return {
+    ...lesson,
+    student_name: "Aluno",
+    student_email: "",
+    enrollment_status: "active",
+    plan_day_title: lesson.title_snapshot,
+    video_count: 0,
+  };
+}
+
+async function ownedLesson(lessonId: string, teacherId: string): Promise<Lesson> {
+  const supabase = await createClient();
+  const lesson = unwrapMaybe(
+    await supabase.from("lessons").select("*").eq("id", lessonId).maybeSingle(),
+  );
+  if (!lesson) throw ApiError.notFound("Aula não encontrada");
+  if (lesson.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
+  return lesson;
+}
+
+async function enrollmentForTeacher(enrollmentId: string, teacherId: string) {
+  const supabase = await createClient();
+  const enrollment = unwrapMaybe(
+    await supabase
+      .from("enrollments")
+      .select("id, teacher_id, student_name, student_email, status")
+      .eq("id", enrollmentId)
+      .maybeSingle(),
+  );
+  if (!enrollment) throw ApiError.notFound("Aluno não encontrado");
+  if (enrollment.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
+  return enrollment;
+}
+
+async function planDayForTeacher(
+  planDayId: string,
+  teacherId: string,
+): Promise<{ day: PlanDay; planStatus: string }> {
+  const supabase = await createClient();
+  const day = unwrapMaybe(
+    await supabase.from("plan_days").select("*").eq("id", planDayId).maybeSingle(),
+  );
+  if (!day) throw ApiError.notFound("Dia do plano não encontrado");
+
+  const plan = unwrapMaybe(
+    await supabase
+      .from("monthly_plans")
+      .select("*")
+      .eq("id", day.monthly_plan_id)
+      .maybeSingle(),
+  );
+  if (!plan) throw ApiError.notFound("Plano não encontrado");
+  if (plan.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
+  if (plan.status === "archived") {
+    throw ApiError.conflict("Não é possível usar um dia de plano arquivado");
+  }
+  return { day, planStatus: plan.status };
+}
+
+/** Detecta sobreposição com outras aulas agendadas do mesmo professor. */
+export async function detectConflicts(
+  teacherId: string,
+  startsAt: string,
+  endsAt: string,
+  excludeLessonId?: string,
+): Promise<LessonListItem[]> {
+  const supabase = await createClient();
+  let query = supabase
+    .from("lessons")
+    .select("*")
+    .eq("teacher_id", teacherId)
+    .eq("status", "scheduled")
+    .lt("starts_at", endsAt)
+    .gt("ends_at", startsAt);
+
+  if (excludeLessonId) query = query.neq("id", excludeLessonId);
+
+  const { data, error } = await query;
+  if (error) throw mapPostgrestError(error);
+  return enrichLessons(data ?? []);
+}
+
+async function lessonVideos(lessonId: string): Promise<LessonVideoWithVideo[]> {
+  const supabase = await createClient();
+  const { data: associations, error } = await supabase
+    .from("lesson_videos")
+    .select("*")
+    .eq("lesson_id", lessonId)
+    .order("sort_order", { ascending: true });
+
+  if (error) throw mapPostgrestError(error);
+  const rows = associations ?? [];
+  if (rows.length === 0) return [];
+
+  const { data: videos, error: videoError } = await supabase
+    .from("videos")
+    .select("*")
+    .in(
+      "id",
+      rows.map((item) => item.video_id),
+    );
+
+  if (videoError) throw mapPostgrestError(videoError);
+  const map = new Map((videos ?? []).map((video) => [video.id, video]));
+
+  const result: LessonVideoWithVideo[] = [];
+  for (const association of rows) {
+    const video = map.get(association.video_id);
+    if (video) result.push({ ...association, video });
+  }
+  return result;
+}
+
+export async function getLessonDetail(
+  lessonId: string,
+  teacherId: string,
+): Promise<LessonDetail> {
+  const lesson = await ownedLesson(lessonId, teacherId);
+  const supabase = await createClient();
+
+  const [planDay, videos, teacher] = await Promise.all([
+    lesson.plan_day_id
+      ? supabase.from("plan_days").select("*").eq("id", lesson.plan_day_id).maybeSingle()
+      : Promise.resolve({ data: null, error: null }),
+    lessonVideos(lessonId),
+    supabase.from("teachers").select("display_name").eq("id", teacherId).maybeSingle(),
+  ]);
+
+  const context = await loadLessonContext(supabase, [lesson]);
 
   return {
-    ...toLessonListItem(lesson),
-    plan_day: planDay,
-    videos: lessonVideos(lessonId),
-    teacher_name: teacher?.display_name ?? "Professor",
+    ...withContext(lesson, context),
+    plan_day: planDay.data ?? null,
+    videos,
+    teacher_name: teacher.data?.display_name ?? "Professor",
   };
 }
 
@@ -126,7 +254,7 @@ export function getLessonDetail(lessonId: string, teacherId: string): LessonDeta
 /* Aulas                                                                       */
 /* -------------------------------------------------------------------------- */
 
-export function getLessons(
+export async function getLessons(
   teacherId: string,
   options: {
     enrollment_id?: string;
@@ -136,41 +264,60 @@ export function getLessons(
     page?: number;
     pageSize?: number;
   } = {},
-): { lessons: LessonListItem[]; pagination: ReturnType<typeof buildPagination> } {
-  const page = options.page ?? 1;
-  const pageSize = options.pageSize ?? 20;
-  let lessons = getDb().lessons.filter((item) => item.teacher_id === teacherId);
+): Promise<{
+  lessons: LessonListItem[];
+  pagination: ReturnType<typeof buildPagination>;
+}> {
+  const supabase = await createClient();
+  const page = Math.max(1, options.page ?? 1);
+  const pageSize = Math.min(Math.max(1, options.pageSize ?? 20), 100);
+  const from = (page - 1) * pageSize;
 
-  if (options.enrollment_id) lessons = lessons.filter((item) => item.enrollment_id === options.enrollment_id);
+  let query = supabase
+    .from("lessons")
+    .select("*", { count: "exact" })
+    .eq("teacher_id", teacherId)
+    .order("starts_at", { ascending: false })
+    .range(from, from + pageSize - 1);
+
+  if (options.enrollment_id) query = query.eq("enrollment_id", options.enrollment_id);
   if (options.status && options.status.length > 0) {
-    lessons = lessons.filter((item) => options.status!.includes(item.status));
+    query = query.in("status", options.status as LessonStatus[]);
   }
-  if (options.from_date) lessons = lessons.filter((item) => item.starts_at >= `${options.from_date}T00:00:00`);
-  if (options.to_date) lessons = lessons.filter((item) => item.starts_at <= `${options.to_date}T23:59:59.999`);
+  if (options.from_date) query = query.gte("starts_at", `${options.from_date}T00:00:00`);
+  if (options.to_date) query = query.lte("starts_at", `${options.to_date}T23:59:59.999`);
 
-  const sorted = lessons
-    .sort((a, b) => b.starts_at.localeCompare(a.starts_at))
-    .map(toLessonListItem);
+  const { data, error, count } = await query;
+  if (error) throw mapPostgrestError(error);
 
   return {
-    lessons: paginate(sorted, page, pageSize),
-    pagination: buildPagination(sorted.length, page, pageSize),
+    lessons: await enrichLessons(data ?? []),
+    pagination: buildPagination(count ?? 0, page, pageSize),
   };
 }
 
-export function createLesson(teacherId: string, data: CreateLessonData): LessonDetail {
-  const enrollment = enrollmentForTeacher(data.enrollment_id, teacherId);
-  if (enrollment.status === "archived") throw ApiError.conflict("Alunos arquivados não podem ter novas aulas");
-  if (enrollment.status === "pending") throw ApiError.conflict("O aluno ainda não aceitou o convite");
-  if (enrollment.status === "paused") throw ApiError.conflict("Reative o vínculo antes de agendar novas aulas");
+export async function createLesson(
+  teacherId: string,
+  data: CreateLessonData,
+): Promise<LessonDetail> {
+  const enrollment = await enrollmentForTeacher(data.enrollment_id, teacherId);
+  if (enrollment.status === "archived") {
+    throw ApiError.conflict("Alunos arquivados não podem ter novas aulas");
+  }
+  if (enrollment.status === "pending") {
+    throw ApiError.conflict("O aluno ainda não aceitou o convite");
+  }
+  if (enrollment.status === "paused") {
+    throw ApiError.conflict("Reative o vínculo antes de agendar novas aulas");
+  }
 
   let planDay: PlanDay | null = null;
   if (data.plan_day_id) {
-    planDay = planDayForTeacher(data.plan_day_id, teacherId).day;
+    planDay = (await planDayForTeacher(data.plan_day_id, teacherId)).day;
   }
 
   if (!data.override_conflict) {
-    const conflicts = detectConflicts(teacherId, data.starts_at, data.ends_at);
+    const conflicts = await detectConflicts(teacherId, data.starts_at, data.ends_at);
     if (conflicts.length > 0) {
       throw new ApiError(409, "CONFLICT", "Já existe uma aula agendada neste horário", {
         conflicts,
@@ -178,47 +325,50 @@ export function createLesson(teacherId: string, data: CreateLessonData): LessonD
     }
   }
 
-  const timestamp = nowIso();
-  const lesson: Lesson = {
-    id: randomUUID(),
-    teacher_id: teacherId,
-    enrollment_id: data.enrollment_id,
-    plan_day_id: data.plan_day_id ?? null,
-    starts_at: data.starts_at,
-    ends_at: data.ends_at,
-    status: "scheduled",
-    completed_at: null,
-    shared_notes: data.shared_notes ?? null,
-    private_notes: data.private_notes ?? null,
-    title_snapshot: planDay?.title ?? null,
-    objective_snapshot: planDay?.objective ?? null,
-    rescheduled_from_id: null,
-    created_at: timestamp,
-    updated_at: timestamp,
-  };
+  const supabase = await createClient();
+  const { data: created, error } = await supabase
+    .from("lessons")
+    .insert({
+      teacher_id: teacherId,
+      enrollment_id: data.enrollment_id,
+      plan_day_id: data.plan_day_id ?? null,
+      starts_at: data.starts_at,
+      ends_at: data.ends_at,
+      status: "scheduled",
+      completed_at: null,
+      shared_notes: data.shared_notes ?? null,
+      private_notes: data.private_notes ?? null,
+      title_snapshot: planDay?.title ?? null,
+      objective_snapshot: planDay?.objective ?? null,
+      rescheduled_from_id: null,
+    })
+    .select("*")
+    .single();
 
-  mutate((db) => {
-    db.lessons.push(lesson);
-  });
-  return getLessonDetail(lesson.id, teacherId);
+  if (error) throw mapPostgrestError(error);
+  return getLessonDetail(created.id, teacherId);
 }
 
-export function updateLesson(
+export async function updateLesson(
   lessonId: string,
   teacherId: string,
   data: UpdateLessonData,
-): LessonDetail {
-  const current = ownedLesson(lessonId, teacherId);
+): Promise<LessonDetail> {
+  const current = await ownedLesson(lessonId, teacherId);
   const changesTime =
-    data.starts_at !== undefined || data.ends_at !== undefined || data.plan_day_id !== undefined;
+    data.starts_at !== undefined ||
+    data.ends_at !== undefined ||
+    data.plan_day_id !== undefined;
 
   if (changesTime && current.status !== "scheduled") {
-    throw ApiError.conflict("Aulas concluídas, canceladas ou com falta não podem ter data/horário alterados");
+    throw ApiError.conflict(
+      "Aulas concluídas, canceladas ou com falta não podem ter data/horário alterados",
+    );
   }
 
   let planDay: PlanDay | null = null;
   if (data.plan_day_id) {
-    planDay = planDayForTeacher(data.plan_day_id, teacherId).day;
+    planDay = (await planDayForTeacher(data.plan_day_id, teacherId)).day;
   }
 
   const startsAt = data.starts_at ?? current.starts_at;
@@ -230,7 +380,7 @@ export function updateLesson(
   }
 
   if (changesTime && !data.override_conflict) {
-    const conflicts = detectConflicts(teacherId, startsAt, endsAt, lessonId);
+    const conflicts = await detectConflicts(teacherId, startsAt, endsAt, lessonId);
     if (conflicts.length > 0) {
       throw new ApiError(409, "CONFLICT", "Já existe uma aula agendada neste horário", {
         conflicts,
@@ -238,26 +388,33 @@ export function updateLesson(
     }
   }
 
-  return mutate((db) => {
-    const lesson = db.lessons.find((item) => item.id === lessonId);
-    if (!lesson) throw ApiError.notFound("Aula não encontrada");
-    if (data.starts_at !== undefined) lesson.starts_at = data.starts_at;
-    if (data.ends_at !== undefined) lesson.ends_at = data.ends_at;
-    if (data.shared_notes !== undefined) lesson.shared_notes = data.shared_notes;
-    if (data.private_notes !== undefined) lesson.private_notes = data.private_notes;
-    if (data.plan_day_id !== undefined) {
-      lesson.plan_day_id = data.plan_day_id;
-      lesson.title_snapshot = planDay?.title ?? null;
-      lesson.objective_snapshot = planDay?.objective ?? null;
-    }
-    lesson.updated_at = nowIso();
-    return getLessonDetail(lessonId, teacherId);
-  });
+  const payload: {
+    starts_at?: string;
+    ends_at?: string;
+    shared_notes?: string | null;
+    private_notes?: string | null;
+    plan_day_id?: string | null;
+    title_snapshot?: string | null;
+    objective_snapshot?: string | null;
+  } = {};
+  if (data.starts_at !== undefined) payload.starts_at = data.starts_at;
+  if (data.ends_at !== undefined) payload.ends_at = data.ends_at;
+  if (data.shared_notes !== undefined) payload.shared_notes = data.shared_notes;
+  if (data.private_notes !== undefined) payload.private_notes = data.private_notes;
+  if (data.plan_day_id !== undefined) {
+    payload.plan_day_id = data.plan_day_id;
+    payload.title_snapshot = planDay?.title ?? null;
+    payload.objective_snapshot = planDay?.objective ?? null;
+  }
+
+  const supabase = await createClient();
+  unwrapVoid(await supabase.from("lessons").update(payload).eq("id", lessonId));
+  return getLessonDetail(lessonId, teacherId);
 }
 
 const FINAL_STATUSES: LessonStatus[] = ["completed", "cancelled", "no_show"];
 
-export function changeLessonStatus(
+export async function changeLessonStatus(
   lessonId: string,
   teacherId: string,
   input: {
@@ -266,8 +423,8 @@ export function changeLessonStatus(
     private_notes?: string | null;
     override_window?: boolean;
   },
-): LessonDetail {
-  const lesson = ownedLesson(lessonId, teacherId);
+): Promise<LessonDetail> {
+  const lesson = await ownedLesson(lessonId, teacherId);
   if (!FINAL_STATUSES.includes(input.status)) {
     throw ApiError.validation("Status inválido para conclusão");
   }
@@ -278,14 +435,24 @@ export function changeLessonStatus(
   }
 
   if (input.status === "completed") {
-    const enrollment = getDb().enrollments.find((item) => item.id === lesson.enrollment_id);
+    const supabase = await createClient();
+    const enrollment = unwrapMaybe(
+      await supabase
+        .from("enrollments")
+        .select("id, status")
+        .eq("id", lesson.enrollment_id)
+        .maybeSingle(),
+    );
     if (enrollment?.status === "archived") {
       throw ApiError.conflict("Não é possível concluir aulas de um vínculo arquivado");
     }
+
     const startsAt = new Date(lesson.starts_at).getTime();
     const now = Date.now();
     if (startsAt > now + 7 * 24 * 60 * 60 * 1000) {
-      throw ApiError.validation("Não é possível concluir uma aula agendada para mais de 7 dias no futuro");
+      throw ApiError.validation(
+        "Não é possível concluir uma aula agendada para mais de 7 dias no futuro",
+      );
     }
     if (startsAt < now - 30 * 24 * 60 * 60 * 1000 && !input.override_window) {
       throw new ApiError(
@@ -297,135 +464,202 @@ export function changeLessonStatus(
     }
   }
 
-  return mutate((db) => {
-    const record = db.lessons.find((item) => item.id === lessonId);
-    if (!record) throw ApiError.notFound("Aula não encontrada");
-    record.status = input.status;
-    if (input.status === "completed") record.completed_at = nowIso();
-    if (input.shared_notes !== undefined) record.shared_notes = input.shared_notes;
-    if (input.private_notes !== undefined) record.private_notes = input.private_notes;
-    record.updated_at = nowIso();
-    return getLessonDetail(lessonId, teacherId);
-  });
+  const payload: {
+    status: LessonStatus;
+    completed_at?: string;
+    shared_notes?: string | null;
+    private_notes?: string | null;
+  } = { status: input.status };
+  if (input.status === "completed") payload.completed_at = new Date().toISOString();
+  if (input.shared_notes !== undefined) payload.shared_notes = input.shared_notes;
+  if (input.private_notes !== undefined) payload.private_notes = input.private_notes;
+
+  const supabase = await createClient();
+  unwrapVoid(await supabase.from("lessons").update(payload).eq("id", lessonId));
+  return getLessonDetail(lessonId, teacherId);
 }
 
 /* -------------------------------------------------------------------------- */
 /* Vídeos da aula                                                              */
 /* -------------------------------------------------------------------------- */
 
-export function addLessonVideo(
+export async function addLessonVideo(
   lessonId: string,
   teacherId: string,
   videoId: string,
   sortOrder?: number,
-): LessonDetail {
-  const lesson = ownedLesson(lessonId, teacherId);
+): Promise<LessonDetail> {
+  const lesson = await ownedLesson(lessonId, teacherId);
   if (lesson.status !== "scheduled") {
     throw ApiError.conflict("Aulas finalizadas não podem receber novos vídeos");
   }
-  const db = getDb();
-  const video = db.videos.find((item) => item.id === videoId);
+
+  const supabase = await createClient();
+  const video = unwrapMaybe(
+    await supabase.from("videos").select("*").eq("id", videoId).maybeSingle(),
+  );
   if (!video) throw ApiError.notFound("Vídeo não encontrado");
   if (video.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
-  if (video.status !== "ready") throw ApiError.conflict("Somente vídeos prontos podem ser associados");
-
-  if (db.lesson_videos.some((item) => item.lesson_id === lessonId && item.video_id === videoId)) {
-    throw ApiError.conflict("Este vídeo já está associado à aula");
+  if (video.status !== "ready") {
+    throw ApiError.conflict("Somente vídeos prontos podem ser associados");
   }
 
-  mutate((database) => {
-    database.lesson_videos.push({
-      id: randomUUID(),
+  const existing = unwrapMaybe(
+    await supabase
+      .from("lesson_videos")
+      .select("id")
+      .eq("lesson_id", lessonId)
+      .eq("video_id", videoId)
+      .maybeSingle(),
+  );
+  if (existing) throw ApiError.conflict("Este vídeo já está associado à aula");
+
+  let order = sortOrder;
+  if (order === undefined) {
+    const last = await supabase
+      .from("lesson_videos")
+      .select("sort_order")
+      .eq("lesson_id", lessonId)
+      .order("sort_order", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    order = (last.data?.sort_order ?? 0) + 1;
+  }
+
+  unwrapVoid(
+    await supabase.from("lesson_videos").insert({
       lesson_id: lessonId,
       video_id: videoId,
       source: "manual",
-      sort_order:
-        sortOrder ??
-        database.lesson_videos
-          .filter((item) => item.lesson_id === lessonId)
-          .reduce((max, item) => Math.max(max, item.sort_order), 0) + 1,
-      created_at: nowIso(),
-    });
-  });
+      sort_order: order,
+    }),
+  );
+
   return getLessonDetail(lessonId, teacherId);
 }
 
-/** Copia os vídeos sugeridos pelo dia do plano (Requisito 9). */
-export function copyPlanVideosToLesson(lessonId: string, teacherId: string): LessonDetail {
-  const lesson = ownedLesson(lessonId, teacherId);
-  if (lesson.status !== "scheduled") throw ApiError.conflict("Aulas finalizadas não podem ser alteradas");
-  if (!lesson.plan_day_id) throw ApiError.validation("A aula não possui um dia do plano vinculado");
+/** Copia os vídeos sugeridos pelo dia do plano. */
+export async function copyPlanVideosToLesson(
+  lessonId: string,
+  teacherId: string,
+): Promise<LessonDetail> {
+  const lesson = await ownedLesson(lessonId, teacherId);
+  if (lesson.status !== "scheduled") {
+    throw ApiError.conflict("Aulas finalizadas não podem ser alteradas");
+  }
+  if (!lesson.plan_day_id) {
+    throw ApiError.validation("A aula não possui um dia do plano vinculado");
+  }
 
-  const db = getDb();
-  const associations = db.plan_day_videos.filter((item) => item.plan_day_id === lesson.plan_day_id);
-  mutate((database) => {
-    for (const association of associations) {
-      const duplicate = database.lesson_videos.some(
-        (item) => item.lesson_id === lessonId && item.video_id === association.video_id,
-      );
-      if (!duplicate) {
-        database.lesson_videos.push({
-          id: randomUUID(),
-          lesson_id: lessonId,
-          video_id: association.video_id,
-          source: "plan",
-          sort_order: association.sort_order,
-          created_at: nowIso(),
-        });
-      }
-    }
-  });
+  const supabase = await createClient();
+  const [associations, existing] = await Promise.all([
+    supabase
+      .from("plan_day_videos")
+      .select("*")
+      .eq("plan_day_id", lesson.plan_day_id),
+    supabase.from("lesson_videos").select("video_id").eq("lesson_id", lessonId),
+  ]);
+
+  if (associations.error) throw mapPostgrestError(associations.error);
+  if (existing.error) throw mapPostgrestError(existing.error);
+
+  const existingIds = new Set((existing.data ?? []).map((item) => item.video_id));
+  const rows = (associations.data ?? [])
+    .filter((association) => !existingIds.has(association.video_id))
+    .map((association) => ({
+      lesson_id: lessonId,
+      video_id: association.video_id,
+      source: "plan" as const,
+      sort_order: association.sort_order,
+    }));
+
+  if (rows.length > 0) {
+    unwrapVoid(await supabase.from("lesson_videos").insert(rows));
+  }
+
   return getLessonDetail(lessonId, teacherId);
 }
 
-export function removeLessonVideo(
+export async function removeLessonVideo(
   lessonId: string,
   teacherId: string,
   associationId: string,
-): LessonDetail {
-  const lesson = ownedLesson(lessonId, teacherId);
+): Promise<LessonDetail> {
+  const lesson = await ownedLesson(lessonId, teacherId);
   if (lesson.status !== "scheduled") {
     throw ApiError.conflict("Aulas finalizadas não podem ter vídeos removidos");
   }
-  const db = getDb();
-  const association = db.lesson_videos.find(
-    (item) => item.id === associationId && item.lesson_id === lessonId,
+
+  const supabase = await createClient();
+  const association = unwrapMaybe(
+    await supabase
+      .from("lesson_videos")
+      .select("*")
+      .eq("id", associationId)
+      .eq("lesson_id", lessonId)
+      .maybeSingle(),
   );
   if (!association) throw ApiError.notFound("Associação não encontrada");
 
-  mutate((database) => {
-    database.lesson_videos = database.lesson_videos.filter((item) => item.id !== associationId);
-    database.lesson_videos
-      .filter((item) => item.lesson_id === lessonId)
-      .sort((a, b) => a.sort_order - b.sort_order)
-      .forEach((item, index) => {
-        item.sort_order = index + 1;
-      });
-  });
+  unwrapVoid(await supabase.from("lesson_videos").delete().eq("id", associationId));
+
+  const remaining = await supabase
+    .from("lesson_videos")
+    .select("id")
+    .eq("lesson_id", lessonId)
+    .order("sort_order", { ascending: true });
+
+  if (remaining.error) throw mapPostgrestError(remaining.error);
+
+  await Promise.all(
+    (remaining.data ?? []).map(async (item, index) => {
+      unwrapVoid(
+        await supabase
+          .from("lesson_videos")
+          .update({ sort_order: index + 1 })
+          .eq("id", item.id),
+      );
+    }),
+  );
+
   return getLessonDetail(lessonId, teacherId);
 }
 
-export function reorderLessonVideos(
+export async function reorderLessonVideos(
   lessonId: string,
   teacherId: string,
   items: Array<{ id: string; sort_order: number }>,
-): LessonDetail {
-  const lesson = ownedLesson(lessonId, teacherId);
+): Promise<LessonDetail> {
+  const lesson = await ownedLesson(lessonId, teacherId);
   if (lesson.status !== "scheduled") {
     throw ApiError.conflict("Aulas finalizadas não podem ser reordenadas");
   }
+
+  const supabase = await createClient();
   for (const item of items) {
-    const association = getDb().lesson_videos.find((record) => record.id === item.id);
+    const association = unwrapMaybe(
+      await supabase
+        .from("lesson_videos")
+        .select("id, lesson_id")
+        .eq("id", item.id)
+        .maybeSingle(),
+    );
     if (!association || association.lesson_id !== lessonId) {
       throw ApiError.validation("Todos os vídeos devem pertencer à mesma aula");
     }
   }
-  mutate((db) => {
-    for (const item of items) {
-      const association = db.lesson_videos.find((record) => record.id === item.id);
-      if (association) association.sort_order = item.sort_order;
-    }
-  });
+
+  await Promise.all(
+    items.map(async (item) => {
+      unwrapVoid(
+        await supabase
+          .from("lesson_videos")
+          .update({ sort_order: item.sort_order })
+          .eq("id", item.id),
+      );
+    }),
+  );
+
   return getLessonDetail(lessonId, teacherId);
 }
 
@@ -433,84 +667,127 @@ export function reorderLessonVideos(
 /* Horários recorrentes                                                        */
 /* -------------------------------------------------------------------------- */
 
-export function getWeeklySlots(
+export async function getWeeklySlots(
   teacherId: string,
   enrollmentId?: string,
-): WeeklySlotWithStudent[] {
-  const db = getDb();
+): Promise<WeeklySlotWithStudent[]> {
+  const supabase = await createClient();
   const today = dateKey(new Date());
-  return db.weekly_slots
-    .filter((item) => item.teacher_id === teacherId)
-    .filter((item) => !enrollmentId || item.enrollment_id === enrollmentId)
-    .filter((item) => !item.valid_until || item.valid_until >= today)
-    .sort((a, b) => a.weekday - b.weekday || a.start_time.localeCompare(b.start_time))
-    .map((slot) => ({
-      ...slot,
-      student_name:
-        db.enrollments.find((item) => item.id === slot.enrollment_id)?.student_name ?? "Aluno",
-    }));
+
+  let query = supabase
+    .from("weekly_slots")
+    .select("*")
+    .eq("teacher_id", teacherId)
+    .order("weekday", { ascending: true })
+    .order("start_time", { ascending: true });
+
+  if (enrollmentId) query = query.eq("enrollment_id", enrollmentId);
+
+  const { data, error } = await query;
+  if (error) throw mapPostgrestError(error);
+
+  const slots = (data ?? []).filter(
+    (slot) => !slot.valid_until || slot.valid_until >= today,
+  );
+  if (slots.length === 0) return [];
+
+  const enrollmentIds = Array.from(new Set(slots.map((slot) => slot.enrollment_id)));
+  const { data: enrollments, error: enrollmentError } = await supabase
+    .from("enrollments")
+    .select("id, student_name")
+    .in("id", enrollmentIds);
+
+  if (enrollmentError) throw mapPostgrestError(enrollmentError);
+  const names = new Map((enrollments ?? []).map((item) => [item.id, item.student_name]));
+
+  return slots.map((slot) => ({
+    ...slot,
+    student_name: names.get(slot.enrollment_id) ?? "Aluno",
+  }));
 }
 
-export function createWeeklySlot(
+export async function createWeeklySlot(
   teacherId: string,
   data: CreateWeeklySlotData,
-): WeeklySlot {
-  const enrollment = enrollmentForTeacher(data.enrollment_id, teacherId);
+): Promise<WeeklySlot> {
+  const enrollment = await enrollmentForTeacher(data.enrollment_id, teacherId);
   if (enrollment.status === "archived" || enrollment.status === "pending") {
-    throw ApiError.conflict("O aluno precisa ter um vínculo ativo ou pausado para receber horários");
+    throw ApiError.conflict(
+      "O aluno precisa ter um vínculo ativo ou pausado para receber horários",
+    );
   }
 
-  const slot: WeeklySlot = {
-    id: randomUUID(),
-    teacher_id: teacherId,
-    enrollment_id: data.enrollment_id,
-    weekday: data.weekday,
-    start_time: data.start_time,
-    end_time: data.end_time,
-    valid_from: data.valid_from ?? dateKey(new Date()),
-    valid_until: data.valid_until ?? null,
-    status: "active",
-    created_at: nowIso(),
-    updated_at: nowIso(),
-  };
-  mutate((db) => {
-    db.weekly_slots.push(slot);
-  });
-  return slot;
+  const supabase = await createClient();
+  const { data: created, error } = await supabase
+    .from("weekly_slots")
+    .insert({
+      teacher_id: teacherId,
+      enrollment_id: data.enrollment_id,
+      weekday: data.weekday,
+      start_time: data.start_time,
+      end_time: data.end_time,
+      valid_from: data.valid_from ?? dateKey(new Date()),
+      valid_until: data.valid_until ?? null,
+      status: "active",
+    })
+    .select("*")
+    .single();
+
+  if (error) throw mapPostgrestError(error);
+  return created;
 }
 
-export function updateWeeklySlot(
+export async function updateWeeklySlot(
   slotId: string,
   teacherId: string,
   data: UpdateWeeklySlotData,
-): WeeklySlot {
-  const slot = getDb().weekly_slots.find((item) => item.id === slotId);
+): Promise<WeeklySlot> {
+  const supabase = await createClient();
+  const slot = unwrapMaybe(
+    await supabase.from("weekly_slots").select("*").eq("id", slotId).maybeSingle(),
+  );
   if (!slot) throw ApiError.notFound("Horário não encontrado");
   if (slot.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
 
   const start = data.start_time ?? slot.start_time;
   const end = data.end_time ?? slot.end_time;
-  if (end <= start) throw ApiError.validation("O horário final deve ser posterior ao inicial");
+  if (end <= start) {
+    throw ApiError.validation("O horário final deve ser posterior ao inicial");
+  }
 
-  return mutate((db) => {
-    const record = db.weekly_slots.find((item) => item.id === slotId);
-    if (!record) throw ApiError.notFound("Horário não encontrado");
-    if (data.weekday !== undefined) record.weekday = data.weekday;
-    if (data.start_time !== undefined) record.start_time = data.start_time;
-    if (data.end_time !== undefined) record.end_time = data.end_time;
-    if (data.valid_from !== undefined) record.valid_from = data.valid_from;
-    if (data.valid_until !== undefined) record.valid_until = data.valid_until;
-    record.updated_at = nowIso();
-    return { ...record };
-  });
+  const payload: {
+    weekday?: number;
+    start_time?: string;
+    end_time?: string;
+    valid_from?: string;
+    valid_until?: string | null;
+  } = {};
+  if (data.weekday !== undefined) payload.weekday = data.weekday;
+  if (data.start_time !== undefined) payload.start_time = data.start_time;
+  if (data.end_time !== undefined) payload.end_time = data.end_time;
+  if (data.valid_from !== undefined) payload.valid_from = data.valid_from;
+  if (data.valid_until !== undefined) payload.valid_until = data.valid_until;
+
+  const { data: updated, error } = await supabase
+    .from("weekly_slots")
+    .update(payload)
+    .eq("id", slotId)
+    .select("*")
+    .single();
+
+  if (error) throw mapPostgrestError(error);
+  return updated;
 }
 
-export function setWeeklySlotStatus(
+export async function setWeeklySlotStatus(
   slotId: string,
   teacherId: string,
   status: "active" | "paused",
-): WeeklySlot {
-  const slot = getDb().weekly_slots.find((item) => item.id === slotId);
+): Promise<WeeklySlot> {
+  const supabase = await createClient();
+  const slot = unwrapMaybe(
+    await supabase.from("weekly_slots").select("*").eq("id", slotId).maybeSingle(),
+  );
   if (!slot) throw ApiError.notFound("Horário não encontrado");
   if (slot.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
   if (slot.status === status) {
@@ -518,22 +795,37 @@ export function setWeeklySlotStatus(
       status === "active" ? "Este horário já está ativo" : "Este horário já está pausado",
     );
   }
-  return mutate((db) => {
-    const record = db.weekly_slots.find((item) => item.id === slotId);
-    if (!record) throw ApiError.notFound("Horário não encontrado");
-    record.status = status;
-    record.updated_at = nowIso();
-    return { ...record };
-  });
+
+  const { data, error } = await supabase
+    .from("weekly_slots")
+    .update({ status })
+    .eq("id", slotId)
+    .select("*")
+    .single();
+
+  if (error) throw mapPostgrestError(error);
+  return data;
 }
 
-export function deleteWeeklySlot(slotId: string, teacherId: string): void {
-  const slot = getDb().weekly_slots.find((item) => item.id === slotId);
+export async function deleteWeeklySlot(
+  slotId: string,
+  teacherId: string,
+): Promise<void> {
+  const supabase = await createClient();
+  const slot = unwrapMaybe(
+    await supabase.from("weekly_slots").select("*").eq("id", slotId).maybeSingle(),
+  );
   if (!slot) throw ApiError.notFound("Horário não encontrado");
   if (slot.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
 
-  const hasGenerated = getDb().lessons.some((lesson) => {
-    if (lesson.enrollment_id !== slot.enrollment_id) return false;
+  const { data: lessons, error } = await supabase
+    .from("lessons")
+    .select("id, starts_at")
+    .eq("enrollment_id", slot.enrollment_id);
+
+  if (error) throw mapPostgrestError(error);
+
+  const hasGenerated = (lessons ?? []).some((lesson) => {
     const date = new Date(lesson.starts_at);
     const weekday = date.getDay();
     const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:00`;
@@ -545,9 +837,8 @@ export function deleteWeeklySlot(slotId: string, teacherId: string): void {
       "Existem aulas geradas a partir deste horário. Pause o horário em vez de excluí-lo.",
     );
   }
-  mutate((db) => {
-    db.weekly_slots = db.weekly_slots.filter((item) => item.id !== slotId);
-  });
+
+  unwrapVoid(await supabase.from("weekly_slots").delete().eq("id", slotId));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -560,7 +851,7 @@ function buildDateTime(date: string, time: string): Date {
   return new Date(year, month - 1, day, Number(hours), Number(minutes ?? 0), 0, 0);
 }
 
-export function generateLessonsFromSlots(
+export async function generateLessonsFromSlots(
   teacherId: string,
   input: {
     date_from: string;
@@ -568,13 +859,40 @@ export function generateLessonsFromSlots(
     confirm?: boolean;
     enrollment_ids?: string[];
   },
-): { suggestions: GeneratedLessonSuggestion[]; created: LessonListItem[] } {
-  const db = getDb();
-  const slots = getDb().weekly_slots.filter(
-    (slot) =>
-      slot.teacher_id === teacherId &&
-      slot.status === "active" &&
-      (!input.enrollment_ids || input.enrollment_ids.includes(slot.enrollment_id)),
+): Promise<{ suggestions: GeneratedLessonSuggestion[]; created: LessonListItem[] }> {
+  const supabase = await createClient();
+
+  const { data: slots, error: slotError } = await supabase
+    .from("weekly_slots")
+    .select("*")
+    .eq("teacher_id", teacherId)
+    .eq("status", "active");
+
+  if (slotError) throw mapPostgrestError(slotError);
+
+  const activeSlots = (slots ?? []).filter(
+    (slot) => !input.enrollment_ids || input.enrollment_ids.includes(slot.enrollment_id),
+  );
+  if (activeSlots.length === 0) return { suggestions: [], created: [] };
+
+  const enrollmentIds = Array.from(new Set(activeSlots.map((slot) => slot.enrollment_id)));
+  const [enrollments, lessons] = await Promise.all([
+    supabase
+      .from("enrollments")
+      .select("id, student_name, status")
+      .in("id", enrollmentIds),
+    supabase
+      .from("lessons")
+      .select("id, enrollment_id, starts_at")
+      .in("enrollment_id", enrollmentIds),
+  ]);
+
+  if (enrollments.error) throw mapPostgrestError(enrollments.error);
+  if (lessons.error) throw mapPostgrestError(lessons.error);
+
+  const enrollmentMap = new Map((enrollments.data ?? []).map((item) => [item.id, item]));
+  const existing = new Set(
+    (lessons.data ?? []).map((lesson) => `${lesson.enrollment_id}|${lesson.starts_at}`),
   );
 
   const suggestions: GeneratedLessonSuggestion[] = [];
@@ -583,22 +901,16 @@ export function generateLessonsFromSlots(
 
   for (let cursor = startDate; cursor <= endDate; cursor = addDays(cursor, 1)) {
     const date = dateKey(cursor);
-    for (const slot of slots) {
+    for (const slot of activeSlots) {
       if (slot.weekday !== cursor.getDay()) continue;
       if (date < slot.valid_from) continue;
       if (slot.valid_until && date > slot.valid_until) continue;
 
-      const start = buildDateTime(date, slot.start_time);
-      const end = buildDateTime(date, slot.end_time);
-      const startsAt = start.toISOString();
-      const endsAt = end.toISOString();
+      const startsAt = buildDateTime(date, slot.start_time).toISOString();
+      const endsAt = buildDateTime(date, slot.end_time).toISOString();
+      if (existing.has(`${slot.enrollment_id}|${startsAt}`)) continue;
 
-      const duplicate = db.lessons.some(
-        (lesson) => lesson.enrollment_id === slot.enrollment_id && lesson.starts_at === startsAt,
-      );
-      if (duplicate) continue;
-
-      const enrollment = db.enrollments.find((item) => item.id === slot.enrollment_id);
+      const enrollment = enrollmentMap.get(slot.enrollment_id);
       if (!enrollment || enrollment.status !== "active") continue;
 
       suggestions.push({
@@ -607,7 +919,7 @@ export function generateLessonsFromSlots(
         starts_at: startsAt,
         ends_at: endsAt,
         weekly_slot_id: slot.id,
-        conflicts: detectConflicts(teacherId, startsAt, endsAt),
+        conflicts: await detectConflicts(teacherId, startsAt, endsAt),
       });
     }
   }
@@ -615,88 +927,93 @@ export function generateLessonsFromSlots(
   suggestions.sort((a, b) => a.starts_at.localeCompare(b.starts_at));
   if (!input.confirm) return { suggestions, created: [] };
 
-  const created = mutate((database) => {
-    const output: LessonListItem[] = [];
-    for (const suggestion of suggestions) {
-      const timestamp = nowIso();
-      const lesson: Lesson = {
-        id: randomUUID(),
+  if (suggestions.length === 0) return { suggestions, created: [] };
+
+  const { data: created, error } = await supabase
+    .from("lessons")
+    .insert(
+      suggestions.map((suggestion) => ({
         teacher_id: teacherId,
         enrollment_id: suggestion.enrollment_id,
         plan_day_id: null,
         starts_at: suggestion.starts_at,
         ends_at: suggestion.ends_at,
-        status: "scheduled",
+        status: "scheduled" as const,
         completed_at: null,
         shared_notes: null,
         private_notes: null,
         title_snapshot: null,
         objective_snapshot: null,
         rescheduled_from_id: null,
-        created_at: timestamp,
-        updated_at: timestamp,
-      };
-      database.lessons.push(lesson);
-      output.push(toLessonListItem(lesson));
-    }
-    return output;
-  });
+      })),
+    )
+    .select("*");
 
-  return { suggestions, created };
+  if (error) throw mapPostgrestError(error);
+  return { suggestions, created: await enrichLessons(created ?? []) };
 }
 
 /* -------------------------------------------------------------------------- */
 /* Agenda                                                                      */
 /* -------------------------------------------------------------------------- */
 
-export function getWeeklyAgenda(
+async function lessonsInRange(
+  teacherId: string,
+  from: string,
+  to: string,
+): Promise<LessonListItem[]> {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("lessons")
+    .select("*")
+    .eq("teacher_id", teacherId)
+    .gte("starts_at", from)
+    .lte("starts_at", to)
+    .order("starts_at", { ascending: true });
+
+  if (error) throw mapPostgrestError(error);
+  return enrichLessons(data ?? []);
+}
+
+export async function getWeeklyAgenda(
   teacherId: string,
   weekStart?: string,
-): { week_start: string; lessons: LessonListItem[] } {
+): Promise<{ week_start: string; lessons: LessonListItem[] }> {
   const base = weekStart ? new Date(`${weekStart}T00:00:00`) : new Date();
   const monday = startOfWeek(base);
   const from = startOfDayIso(monday);
   const to = endOfDayIso(addDays(monday, 6));
-  const lessons = getDb()
-    .lessons.filter(
-      (item) =>
-        item.teacher_id === teacherId &&
-        item.starts_at >= from &&
-        item.starts_at <= to,
-    )
-    .sort((a, b) => a.starts_at.localeCompare(b.starts_at))
-    .map(toLessonListItem);
-
-  return { week_start: dateKey(monday), lessons };
+  return {
+    week_start: dateKey(monday),
+    lessons: await lessonsInRange(teacherId, from, to),
+  };
 }
 
-export function getDailyAgenda(
+export async function getDailyAgenda(
   teacherId: string,
   date?: string,
-): { date: string; lessons: LessonListItem[] } {
+): Promise<{ date: string; lessons: LessonListItem[] }> {
   const day = date ? new Date(`${date}T00:00:00`) : new Date();
-  const from = startOfDayIso(day);
-  const to = endOfDayIso(day);
-  const lessons = getDb()
-    .lessons.filter(
-      (item) =>
-        item.teacher_id === teacherId && item.starts_at >= from && item.starts_at <= to,
-    )
-    .sort((a, b) => a.starts_at.localeCompare(b.starts_at))
-    .map(toLessonListItem);
-
-  return { date: dateKey(day), lessons };
+  return {
+    date: dateKey(day),
+    lessons: await lessonsInRange(teacherId, startOfDayIso(day), endOfDayIso(day)),
+  };
 }
 
-export function getLessonStats(
+export async function getLessonStats(
   teacherId: string,
   options: { enrollment_id?: string; from_date?: string; to_date?: string } = {},
-): LessonStats {
-  let lessons = getDb().lessons.filter((item) => item.teacher_id === teacherId);
-  if (options.enrollment_id) lessons = lessons.filter((item) => item.enrollment_id === options.enrollment_id);
-  if (options.from_date) lessons = lessons.filter((item) => item.starts_at >= `${options.from_date}T00:00:00`);
-  if (options.to_date) lessons = lessons.filter((item) => item.starts_at <= `${options.to_date}T23:59:59.999`);
+): Promise<LessonStats> {
+  const supabase = await createClient();
+  let query = supabase.from("lessons").select("status").eq("teacher_id", teacherId);
+  if (options.enrollment_id) query = query.eq("enrollment_id", options.enrollment_id);
+  if (options.from_date) query = query.gte("starts_at", `${options.from_date}T00:00:00`);
+  if (options.to_date) query = query.lte("starts_at", `${options.to_date}T23:59:59.999`);
 
+  const { data, error } = await query;
+  if (error) throw mapPostgrestError(error);
+
+  const lessons = data ?? [];
   const completed = lessons.filter((item) => item.status === "completed").length;
   return {
     enrollment_id: options.enrollment_id ?? "",
@@ -705,7 +1022,8 @@ export function getLessonStats(
     cancelled: lessons.filter((item) => item.status === "cancelled").length,
     no_show: lessons.filter((item) => item.status === "no_show").length,
     total: lessons.length,
-    completion_rate: lessons.length === 0 ? 0 : Math.round((completed / lessons.length) * 100),
+    completion_rate:
+      lessons.length === 0 ? 0 : Math.round((completed / lessons.length) * 100),
   };
 }
 
@@ -713,55 +1031,77 @@ export function getLessonStats(
 /* Dashboard do professor                                                      */
 /* -------------------------------------------------------------------------- */
 
-export function getTeacherDashboard(teacherId: string): DashboardData {
-  const db = getDb();
+export async function getTeacherDashboard(teacherId: string): Promise<DashboardData> {
+  const supabase = await createClient();
   const now = new Date();
   const todayStart = startOfDayIso(now);
   const todayEnd = endOfDayIso(now);
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
   const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString();
-  const nowIsoValue = nowIso();
+  const nowValue = now.toISOString();
 
-  const teacherLessons = db.lessons.filter((item) => item.teacher_id === teacherId);
-  const activeStudents = db.enrollments.filter(
-    (item) => item.teacher_id === teacherId && item.status === "active",
-  ).length;
-  const pendingInvites = db.enrollments.filter(
-    (item) => item.teacher_id === teacherId && item.status === "pending",
-  ).length;
-  const activePlans = db.monthly_plans.filter(
-    (item) => item.teacher_id === teacherId && item.status === "published",
-  ).length;
-  const libraryVideos = db.videos.filter(
-    (item) => item.teacher_id === teacherId && item.status === "ready",
-  ).length;
+  const [activeStudents, pendingInvites, activePlans, libraryVideos, todaysLessons, monthLessons, upcoming] =
+    await Promise.all([
+      supabase
+        .from("enrollments")
+        .select("id", { count: "exact", head: true })
+        .eq("teacher_id", teacherId)
+        .eq("status", "active"),
+      supabase
+        .from("enrollments")
+        .select("id", { count: "exact", head: true })
+        .eq("teacher_id", teacherId)
+        .eq("status", "pending"),
+      supabase
+        .from("monthly_plans")
+        .select("id", { count: "exact", head: true })
+        .eq("teacher_id", teacherId)
+        .eq("status", "published"),
+      supabase
+        .from("videos")
+        .select("id", { count: "exact", head: true })
+        .eq("teacher_id", teacherId)
+        .eq("status", "ready"),
+      supabase
+        .from("lessons")
+        .select("*")
+        .eq("teacher_id", teacherId)
+        .gte("starts_at", todayStart)
+        .lte("starts_at", todayEnd)
+        .order("starts_at", { ascending: true }),
+      supabase
+        .from("lessons")
+        .select("status")
+        .eq("teacher_id", teacherId)
+        .gte("starts_at", monthStart)
+        .lt("starts_at", monthEnd),
+      supabase
+        .from("lessons")
+        .select("*")
+        .eq("teacher_id", teacherId)
+        .eq("status", "scheduled")
+        .gte("starts_at", nowValue)
+        .order("starts_at", { ascending: true })
+        .limit(5),
+    ]);
 
-  const today = teacherLessons.filter(
-    (item) => item.starts_at >= todayStart && item.starts_at <= todayEnd,
-  );
+  for (const result of [activeStudents, pendingInvites, activePlans, libraryVideos, todaysLessons, monthLessons, upcoming]) {
+    if (result.error) throw mapPostgrestError(result.error);
+  }
+
+  const monthRows = monthLessons.data ?? [];
+  const todayRows = todaysLessons.data ?? [];
 
   return {
-    active_students: activeStudents,
-    lessons_today: today.filter((item) => item.status === "scheduled").length,
-    completed_this_month: teacherLessons.filter(
-      (item) => item.status === "completed" && item.starts_at >= monthStart && item.starts_at < monthEnd,
-    ).length,
-    cancelled_this_month: teacherLessons.filter(
-      (item) => item.status === "cancelled" && item.starts_at >= monthStart && item.starts_at < monthEnd,
-    ).length,
-    no_show_this_month: teacherLessons.filter(
-      (item) => item.status === "no_show" && item.starts_at >= monthStart && item.starts_at < monthEnd,
-    ).length,
-    upcoming_lessons: teacherLessons
-      .filter((item) => item.status === "scheduled" && item.starts_at >= nowIsoValue)
-      .sort((a, b) => a.starts_at.localeCompare(b.starts_at))
-      .slice(0, 5)
-      .map(toLessonListItem),
-    next_lessons_today: today
-      .sort((a, b) => a.starts_at.localeCompare(b.starts_at))
-      .map(toLessonListItem),
-    pending_invites: pendingInvites,
-    active_plans: activePlans,
-    library_videos: libraryVideos,
+    active_students: activeStudents.count ?? 0,
+    lessons_today: todayRows.filter((item) => item.status === "scheduled").length,
+    completed_this_month: monthRows.filter((item) => item.status === "completed").length,
+    cancelled_this_month: monthRows.filter((item) => item.status === "cancelled").length,
+    no_show_this_month: monthRows.filter((item) => item.status === "no_show").length,
+    upcoming_lessons: await enrichLessons(upcoming.data ?? []),
+    next_lessons_today: await enrichLessons(todayRows),
+    pending_invites: pendingInvites.count ?? 0,
+    active_plans: activePlans.count ?? 0,
+    library_videos: libraryVideos.count ?? 0,
   };
 }

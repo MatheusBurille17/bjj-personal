@@ -49,6 +49,20 @@ Drive do aluno/
 A tabela `drive_folder_mappings` guarda os IDs para evitar recriação. A criação
 é idempotente por nome + pasta pai.
 
+### Conexão única com o Google
+
+O login social e o Google Drive compartilham **um único consentimento OAuth**.
+Ao conectar a conta Google, os tokens são gravados em `user_google_oauth` e
+espelhados em `providers_oauth_tokens`. Usuários que já tinham apenas o login
+social são adotados automaticamente na primeira operação do Drive, sem novo
+consentimento. As telas de configurações/perfil exibem somente um botão
+“Conectar conta Google”; o card do Drive é apenas informativo (`readOnly`).
+
+Os endpoints `/api/google-drive/oauth/*` continuam disponíveis por
+compatibilidade, mas a UI usa `/api/auth/google/*`. Ao desconectar o Google, os
+dois conjuntos de tokens são removidos e o usuário pode reconectar quando
+quiser.
+
 ---
 
 ## Variáveis de ambiente
@@ -67,7 +81,10 @@ A tabela `drive_folder_mappings` guarda os IDs para evitar recriação. A criaç
 | `GOOGLE_DRIVE_CIRCUIT_BREAKER_MS` | não | Pausa após 5 falhas (padrão 5min) |
 | `PLAYBACK_TOKEN_SECRET` | produção | Segredo HMAC das URLs de reprodução (fallback `AUTH_SECRET`) |
 
-Use escopo **`drive.file`** (mínimo). Não use o escopo global `drive`.
+O consentimento unificado usa o escopo `https://www.googleapis.com/auth/drive`
+já exigido pelo login social. O fluxo legado do Drive (`/api/google-drive/oauth/*`)
+usa `drive.file`. Prefira `drive.file` em novos projetos que não dependam do
+login social com escopo amplo.
 
 ---
 
@@ -213,8 +230,10 @@ mensagem amigável.
 
 ## Guia rápido — instrutor
 
-1. Abra **Configurações → Google Drive** e clique em **Conectar ao Google Drive**.
-2. Autorize o acesso; a estrutura `Plataforma de Treinamento/Biblioteca` é criada.
+1. Abra **Configurações → Conta Google** e clique em **Conectar conta Google**.
+   O mesmo consentimento autoriza o Google Drive; não há segunda autorização.
+2. Autorize o acesso; a estrutura `Plataforma de Treinamento/Biblioteca` é criada
+   na primeira operação do Drive.
 3. Na **Biblioteca**, clique em **Upload de vídeo**, escolha o módulo, o arquivo
    (mp4/mov/webm/avi/mkv/flv/wmv, até 5GB) e envie.
 4. Para liberar a alunos, compartilhe a pasta no Google Drive com o e-mail do
@@ -223,7 +242,8 @@ mensagem amigável.
 
 ## Guia rápido — aluno
 
-1. Abra **Meu perfil → Google Drive** e conecte sua conta.
+1. Abra **Meu perfil → Conta Google** e conecte sua conta (o Drive é autorizado
+   no mesmo consentimento).
 2. Em **Meus Vídeos Pessoais**, clique em **Upload de vídeo pessoal**.
 3. Para compartilhar com o professor, use o compartilhamento do Drive ou o
    endpoint de share do vídeo.

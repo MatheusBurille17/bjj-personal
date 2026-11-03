@@ -30,6 +30,11 @@ import {
 } from "./oauth-state.service";
 import { encrypt, decrypt } from "./token-encryption.service";
 import { logOAuthAudit } from "./oauth-audit.service";
+import {
+  clearDriveTokenRecord,
+  storeDriveTokens,
+  syncDriveAccessToken,
+} from "./google-drive-token.service";
 
 export const TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000;
 export const DEFAULT_GOOGLE_REDIRECT_PATH = "/dashboard";
@@ -313,6 +318,20 @@ export function getUserGoogleOAuth(userId: string): GoogleOAuthRecord | null {
 
 /** Visão segura (sem tokens) para API e componentes. */
 export function getGoogleOAuthStatus(userId: string): GoogleOAuthPublicStatus {
+  // O login social/Drive ainda usa o repositório local; não exponha estado
+  // antigo quando o runtime é Supabase.
+  if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+    return {
+      connected: false,
+      googleEmail: null,
+      googleName: null,
+      picture: null,
+      lastTokenRefreshAt: null,
+      consentTimestamp: null,
+      scopesGranted: [],
+    };
+  }
+
   const record = getUserGoogleOAuth(userId);
   if (!record) {
     return {
@@ -472,6 +491,7 @@ export async function refreshUserGoogleToken(
       current.scopes_granted = parseScopes(refreshed.scope, current.scopes_granted);
     }
   });
+  syncDriveAccessToken(userId, newAccess.encrypted, newAccess.iv, expiresAt);
 
   logOAuthAudit({
     event: "google_token_refreshed",
@@ -540,6 +560,7 @@ export async function disconnectGoogleAccount(
   }
 
   clearGoogleTokens(userId);
+  clearDriveTokenRecord(userId);
 
   logOAuthAudit({
     event: "google_disconnected",
@@ -731,7 +752,26 @@ export async function signInWithGoogleProfile(
     );
   }
 
-  const roles = getUserRoles(userId);
+  // Um único consentimento Google conecta também o Google Drive. Se o
+  // espelhamento falhar, o login social continua válido e o usuário pode
+  // reconectar depois.
+  try {
+    await storeDriveTokens(userId, {
+      accessToken: input.credential.access_token,
+      refreshToken: input.credential.refresh_token,
+      expiresIn: input.credential.expires_in,
+      scope: input.credential.scope,
+      driveId: input.profile.email,
+      googleEmail: input.profile.email,
+    });
+  } catch (error) {
+    console.warn("[google-auth] falha ao conectar o Google Drive", {
+      user_id: userId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const roles = await getUserRoles(userId);
   if (!roles.is_teacher && !roles.is_student) {
     throw ApiError.forbidden("Sua conta ainda não possui um vínculo ativo");
   }

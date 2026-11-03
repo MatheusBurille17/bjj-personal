@@ -65,6 +65,7 @@ import {
 import {
   getOAuthAuditLogs,
 } from "@/lib/services/oauth-audit.service";
+import { getDriveTokenRecord } from "@/lib/services/google-drive-token.service";
 import { resetRateLimitStore } from "@/lib/middleware/rate-limit";
 import {
   assertHttpsUrlInProduction,
@@ -526,6 +527,8 @@ describe("unit — serviço Google Auth", () => {
     );
     expect(db.teachers.some((teacher) => teacher.id === users[0].id)).toBe(true);
     expect(getUserGoogleOAuth(users[0].id)?.is_connected).toBe(true);
+    // O mesmo consentimento também conecta o Google Drive.
+    expect(getDriveTokenRecord(users[0].id)?.google_email).toBe(email);
   });
 
   it("reverte o novo usuário quando o armazenamento dos tokens falha", async () => {
@@ -685,6 +688,7 @@ describe("unit — serviço Google Auth", () => {
     expect(record.encrypted_access_token).toBe("");
     expect(record.encrypted_refresh_token).toBe("");
     expect(record.is_connected).toBe(false);
+    expect(getDriveTokenRecord(DEMO_IDS.teacher)).toBeNull();
     const audit = getOAuthAuditLogs(DEMO_IDS.teacher);
     expect(audit.some((log) => log.event === "google_disconnected")).toBe(true);
   });

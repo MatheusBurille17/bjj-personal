@@ -2,8 +2,7 @@
 
 Plataforma web responsiva para professores particulares de Jiu-Jitsu planejarem aulas, gerenciarem alunos, organizarem a agenda e manterem uma biblioteca técnica com vídeos. Inclui o portal do aluno com agenda, plano publicado, histórico e biblioteca autorizada.
 
-> **Status:** MVP funcional validado com `type-check`, `lint`, `test` e `build`.
-> O ambiente padrão roda sem serviços externos, com dados locais de demonstração.
+> **Status:** runtime em Supabase (Postgres + Auth + RLS). O modo local em `.data/db.json` permanece apenas como referência histórica e para testes.
 
 ---
 
@@ -16,7 +15,8 @@ Plataforma web responsiva para professores particulares de Jiu-Jitsu planejarem 
   Veja [`docs/google-social-authentication.md`](docs/google-social-authentication.md).
 - Armazenamento de vídeos no Google Drive (instrutor e aluno), upload em chunks,
   URL de reprodução efêmera, compartilhamento nativo, auditoria de acessos,
-  migração Mux → Drive e modo híbrido. Veja
+  migração Mux → Drive e modo híbrido. Login social e Drive usam **um único
+  consentimento Google**. Veja
   [`docs/google-drive-video-storage.md`](docs/google-drive-video-storage.md).
 - Convite de aluno por token seguro (7 dias), aceite e criação/vinculação de conta.
 - Recuperação e redefinição de senha (link com validade de 1 hora).
@@ -150,7 +150,7 @@ supabase db push
    A redirect URI do Drive deve ser cadastrada no Google Cloud. Veja
    [`docs/google-drive-video-storage.md`](docs/google-drive-video-storage.md).
 
-> O runtime atual do MVP usa o repositório JSON local e autenticação própria. A camada Supabase, o schema e as políticas RLS estão prontos para a migração; veja [`docs/DEVIATIONS.md`](docs/DEVIATIONS.md).
+> O runtime usa Supabase (Postgres, Auth e RLS). O schema e as políticas estão em `supabase/migrations`; o passo a passo da migração e o que ainda falta estão em [`docs/supabase-migration.md`](docs/supabase-migration.md).
 
 ---
 

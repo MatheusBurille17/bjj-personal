@@ -15,7 +15,7 @@ export default async function InvitePage({
   const { token } = await params;
 
   try {
-    const invite = verifyInviteToken(token);
+    const invite = await verifyInviteToken(token);
     return (
       <InviteSignupForm
         token={token}

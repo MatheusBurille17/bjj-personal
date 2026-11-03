@@ -12,7 +12,7 @@ export const runtime = "nodejs";
 export const GET = route<{ id: string }>(async (request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
-  const video = getVideo(id, session.user.id);
+  const video = await getVideo(id, session.user.id);
 
   if (video.provider === "google_drive") {
     try {

@@ -1,6 +1,7 @@
 import type { ProfileResponse, TeacherProfile } from "@/types/auth";
-import { getDb, mutate, nowIso } from "@/lib/db/store";
 import { getUserRoles } from "@/lib/auth/session";
+import { createClient } from "@/lib/supabase/server";
+import { unwrapMaybe, unwrapVoid } from "@/lib/supabase/errors";
 import { ApiError } from "@/lib/middleware/errors";
 import {
   MAX_AVATAR_BYTES,
@@ -9,48 +10,63 @@ import {
 } from "@/lib/utils/validation";
 
 /** Retorna o perfil e, quando aplicável, a configuração de professor. */
-export function getProfileView(userId: string): ProfileResponse {
-  const db = getDb();
-  const profile = db.profiles.find((item) => item.id === userId);
-  if (!profile) throw new ApiError(404, "NOT_FOUND", "Perfil não encontrado");
+export async function getProfileView(userId: string): Promise<ProfileResponse> {
+  const supabase = await createClient();
+  const [profile, teacher, roles] = await Promise.all([
+    supabase.from("profiles").select("*").eq("id", userId).maybeSingle(),
+    supabase.from("teachers").select("*").eq("id", userId).maybeSingle(),
+    getUserRoles(userId, supabase),
+  ]);
 
-  const teacher = db.teachers.find((item) => item.id === userId) ?? null;
+  const profileData = unwrapMaybe(profile);
+  if (!profileData) throw ApiError.notFound("Perfil não encontrado");
+
+  const teacherData = unwrapMaybe(teacher);
   return {
-    profile,
-    ...(teacher ? { teacher } : {}),
-    roles: getUserRoles(userId),
+    profile: profileData,
+    ...(teacherData ? { teacher: teacherData } : {}),
+    roles,
   };
 }
 
-export function getTeacherProfile(userId: string): TeacherProfile | null {
-  return getDb().teachers.find((item) => item.id === userId) ?? null;
+export async function getTeacherProfile(userId: string): Promise<TeacherProfile | null> {
+  const supabase = await createClient();
+  return unwrapMaybe(
+    await supabase.from("teachers").select("*").eq("id", userId).maybeSingle(),
+  );
 }
 
 /**
  * Perfil público do professor: somente dados de exibição.
- * Nunca inclui fuso horário, notas ou configurações internas (Req. 12.2/12.5).
+ * Nunca inclui fuso horário, notas ou configurações internas.
  */
-export function getTeacherPublicProfile(
+export async function getTeacherPublicProfile(
   teacherId: string,
   requesterId: string,
-): { id: string; display_name: string; avatar_url: string | null; bio: string | null } {
-  const db = getDb();
-  const teacher = db.teachers.find((item) => item.id === teacherId);
-  if (!teacher) throw new ApiError(404, "NOT_FOUND", "Professor não encontrado");
+): Promise<{ id: string; display_name: string; avatar_url: string | null; bio: string | null }> {
+  const supabase = await createClient();
+  const [teacherResult, profileResult, enrollmentResult] = await Promise.all([
+    supabase.from("teachers").select("*").eq("id", teacherId).maybeSingle(),
+    supabase.from("profiles").select("*").eq("id", teacherId).maybeSingle(),
+    supabase
+      .from("enrollments")
+      .select("id")
+      .eq("teacher_id", teacherId)
+      .eq("student_profile_id", requesterId)
+      .eq("status", "active")
+      .limit(1)
+      .maybeSingle(),
+  ]);
 
-  const isSelf = teacherId === requesterId;
-  const isEnrolledStudent = db.enrollments.some(
-    (enrollment) =>
-      enrollment.teacher_id === teacherId &&
-      enrollment.student_profile_id === requesterId &&
-      enrollment.status === "active",
-  );
+  const teacher = unwrapMaybe(teacherResult);
+  const profile = unwrapMaybe(profileResult);
+  const isEnrolledStudent = Boolean(unwrapMaybe(enrollmentResult));
 
-  if (!isSelf && !isEnrolledStudent) {
-    throw new ApiError(403, "FORBIDDEN", "Acesso negado");
+  if (!teacher) throw ApiError.notFound("Professor não encontrado");
+  if (teacherId !== requesterId && !isEnrolledStudent) {
+    throw ApiError.forbidden("Acesso negado");
   }
 
-  const profile = db.profiles.find((item) => item.id === teacherId);
   return {
     id: teacher.id,
     display_name: teacher.display_name,
@@ -60,37 +76,45 @@ export function getTeacherPublicProfile(
 }
 
 /**
- * Processa o upload de avatar no modo local, convertendo a imagem em data URL.
- * A interface de armazenamento é equivalente ao bucket `avatars` do Supabase.
+ * Upload de avatar.
+ *
+ * O runtime Supabase mantém o avatar como data URL no perfil para que a imagem
+ * continue visível mesmo com o bucket privado. O bucket `avatars` permanece
+ * disponível para uma migração futura para URLs assinadas.
  */
-export async function uploadAvatar(userId: string, file: File): Promise<{ avatar_url: string }> {
+export async function uploadAvatar(
+  userId: string,
+  file: File,
+): Promise<{ avatar_url: string }> {
   if (!isValidImageType(file.type)) {
     throw ApiError.validation("Formato inválido. Envie JPEG, PNG ou WebP.");
   }
   if (!isValidImageSize(file.size)) {
-    throw ApiError.validation(`A imagem deve ter no máximo ${MAX_AVATAR_BYTES / (1024 * 1024)}MB.`);
+    throw ApiError.validation(
+      `A imagem deve ter no máximo ${MAX_AVATAR_BYTES / (1024 * 1024)}MB.`,
+    );
   }
 
   const buffer = Buffer.from(await file.arrayBuffer());
   const dataUrl = `data:${file.type};base64,${buffer.toString("base64")}`;
 
-  mutate((db) => {
-    const profile = db.profiles.find((item) => item.id === userId);
-    if (!profile) throw new ApiError(404, "NOT_FOUND", "Perfil não encontrado");
-    profile.avatar_url = dataUrl;
-    profile.updated_at = nowIso();
-  });
+  const supabase = await createClient();
+  const result = await supabase
+    .from("profiles")
+    .update({ avatar_url: dataUrl })
+    .eq("id", userId);
+  unwrapVoid(result);
 
   return { avatar_url: dataUrl };
 }
 
-export function removeAvatar(userId: string): ProfileResponse {
-  mutate((db) => {
-    const profile = db.profiles.find((item) => item.id === userId);
-    if (profile) {
-      profile.avatar_url = null;
-      profile.updated_at = nowIso();
-    }
-  });
+export async function removeAvatar(userId: string): Promise<ProfileResponse> {
+  const supabase = await createClient();
+  const result = await supabase
+    .from("profiles")
+    .update({ avatar_url: null })
+    .eq("id", userId);
+  unwrapVoid(result);
+
   return getProfileView(userId);
 }

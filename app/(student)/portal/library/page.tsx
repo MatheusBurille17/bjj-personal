@@ -10,7 +10,7 @@ export const dynamic = "force-dynamic";
 export default async function StudentLibraryPage() {
   const session = await getCurrentSession();
   if (!session) redirect("/login");
-  const techniques = getStudentLibraryTechniques(session.user.id);
+  const techniques = await getStudentLibraryTechniques(session.user.id);
 
   return <StudentLibraryView techniques={techniques} />;
 }

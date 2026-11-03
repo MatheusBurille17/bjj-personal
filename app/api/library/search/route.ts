@@ -11,7 +11,7 @@ export const runtime = "nodejs";
 export const GET = route(async (request) => {
   const session = await requireApiTeacher();
   const { searchParams } = new URL(request.url);
-  const result = searchVideos(session.user.id, {
+  const result = await searchVideos(session.user.id, {
     search: searchParams.get("search") ?? "",
     includeArchived: searchParams.get("includeArchived") === "true",
     page: parseQueryInt(searchParams.get("page"), 1),

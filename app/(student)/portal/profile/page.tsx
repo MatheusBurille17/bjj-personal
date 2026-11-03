@@ -30,9 +30,9 @@ export default async function StudentProfilePage({
   const params = await searchParams;
   const session = await getCurrentSession();
   if (!session) redirect("/login");
-  const profile = getStudentProfile(session.user.id);
-  const teachers = getStudentTeachers(session.user.id);
-  const stats = getStudentStatistics(session.user.id);
+  const profile = await getStudentProfile(session.user.id);
+  const teachers = await getStudentTeachers(session.user.id);
+  const stats = await getStudentStatistics(session.user.id);
   const googleStatus = getGoogleOAuthStatus(session.user.id);
   const driveStatus = await getDriveConnectionStatus(session.user.id);
 
@@ -127,7 +127,11 @@ export default async function StudentProfilePage({
             </Alert>
           ) : null}
 
-          <GoogleDriveStatus redirectPath="/portal/profile" initialStatus={driveStatus} />
+          <GoogleDriveStatus
+            redirectPath="/portal/profile"
+            initialStatus={driveStatus}
+            readOnly
+          />
 
           {stats.by_teacher.length > 0 ? (
             <Card>
@@ -145,10 +149,7 @@ export default async function StudentProfilePage({
             </Card>
           ) : null}
 
-          <PersonalVideosSection
-            driveConnected={driveStatus.connected}
-            redirectPath="/portal/profile"
-          />
+          <PersonalVideosSection driveConnected={driveStatus.connected} />
 
           <Alert>
             <p className="font-medium">Privacidade</p>

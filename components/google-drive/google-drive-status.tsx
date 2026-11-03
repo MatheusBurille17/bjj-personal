@@ -32,12 +32,16 @@ function formatBytes(bytes: number | null): string {
 export interface GoogleDriveStatusProps {
   redirectPath: string;
   initialStatus?: DriveStatusResponse | null;
+  /** Quando true, não exibe um segundo botão de conexão (a conta Google já é
+   *  conectada pela seção principal). */
+  readOnly?: boolean;
 }
 
 /** Card de status, quota e conexão do Google Drive. */
 export function GoogleDriveStatus({
   redirectPath,
   initialStatus = null,
+  readOnly = false,
 }: GoogleDriveStatusProps) {
   const router = useRouter();
   const [status, setStatus] = React.useState<DriveStatusResponse | null>(initialStatus);
@@ -173,14 +177,17 @@ export function GoogleDriveStatus({
         ) : (
           <>
             <p className="text-sm text-muted-foreground">
-              Conecte sua conta Google para armazenar e reproduzir vídeos com o
-              Google Drive.
+              {readOnly
+                ? "Conecte sua conta Google na seção de conta acima para ativar o armazenamento de vídeos."
+                : "Conecte sua conta Google para armazenar e reproduzir vídeos com o Google Drive."}
             </p>
-            <GoogleDriveConnectButton
-              redirectPath={redirectPath}
-              onError={setError}
-              onConnected={() => void load()}
-            />
+            {readOnly ? null : (
+              <GoogleDriveConnectButton
+                redirectPath={redirectPath}
+                onError={setError}
+                onConnected={() => void load()}
+              />
+            )}
           </>
         )}
 
