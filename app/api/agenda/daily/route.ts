@@ -11,5 +11,5 @@ export const GET = route(async (request) => {
     week_start: searchParams.get("week_start") ?? undefined,
     date: searchParams.get("date") ?? undefined,
   });
-  return jsonSuccess(getDailyAgenda(session.user.id, query.date));
+  return jsonSuccess(await getDailyAgenda(session.user.id, query.date));
 });

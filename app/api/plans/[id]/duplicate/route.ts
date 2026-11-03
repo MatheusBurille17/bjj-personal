@@ -6,5 +6,5 @@ export const runtime = "nodejs";
 export const POST = route<{ id: string }>(async (_request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
-  return jsonCreated(duplicatePlan(id, session.user.id));
+  return jsonCreated(await duplicatePlan(id, session.user.id));
 });

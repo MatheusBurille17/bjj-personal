@@ -5,6 +5,7 @@ import {
   checkRateLimit,
   getClientIp,
   rateLimitResponse,
+  type RateLimitResult,
 } from "@/lib/middleware/rate-limit";
 import { enforceHttpsInProduction } from "@/lib/utils/https";
 import { sanitizeRedirectPath } from "@/lib/utils/url";
@@ -29,7 +30,7 @@ function redirectWithError(
   request: Request,
   redirectPath: string | undefined,
   code: string,
-  limit: ReturnType<typeof checkRateLimit>,
+  limit: RateLimitResult,
 ) {
   const forceLogin =
     code === "email_mismatch_on_connect" || code === "unauthorized";
@@ -56,7 +57,7 @@ function errorCodeFrom(error: unknown): string {
 }
 
 export const GET = route(async (request) => {
-  const limit = checkRateLimit(`drive-oauth-callback:${getClientIp(request)}`);
+  const limit = await checkRateLimit(`drive-oauth-callback:${getClientIp(request)}`);
   if (!limit.allowed) return rateLimitResponse(limit);
   enforceHttpsInProduction(request);
 

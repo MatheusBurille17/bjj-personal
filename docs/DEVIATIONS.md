@@ -206,14 +206,15 @@ Drive, permissões nativas, modo híbrido, migração e tratamento de erros).
   preview do Drive. Assim a expiração é aplicada pelo servidor e nenhuma URL é
   persistida (Propriedade 16). O design citava cache de 30s; optamos por não
   cachear URLs por segurança.
-- **Chunks:** o upload em chunks usa sessões de 5MB e acumula no processo antes
-  do envio final ao Drive. Para arquivos muito grandes (>500MB) em produção,
-  recomenda-se ligar as sessões ao protocolo resumable nativo e armazenar chunks
-  em storage temporário/Redis, em vez de memória.
+- **Upload:** o navegador usa a sessão resumable nativa do Google Drive em
+  chunks de 8 MiB (`Content-Range`); o corpo não passa pela Vercel, eliminando o
+  limite de 4,5 MB. O servidor apenas cria a sessão, valida o arquivo e grava os
+  metadados no Supabase.
 - **WebSocket:** o progresso é exposto por polling HTTP no componente de upload;
   WebSocket ficou como opcional não necessário no MVP.
-- **Migração assíncrona:** usa `queueMicrotask` no processo. Em produção deve ser
-  substituída por fila distribuída (Bull/Redis) com retry e notificação.
+- **Migração Mux → Drive:** execução sob demanda em lotes (`POST
+  /api/videos/migrate/:jobId`), sem `queueMicrotask`. Pode ser automatizada por
+  Cron Job ou fila externa (Bull/Redis).
 - **Permissões:** além do compartilhamento nativo do Drive, a aplicação mantém a
   ACL existente de técnica/aula/plano antes de consultar o Drive, como defesa em
   profundidade (o design permite verificar RLS + Drive).

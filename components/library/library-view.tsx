@@ -589,8 +589,8 @@ export function LibraryView({ tree, initialNew = false }: { tree: LibraryTree; i
         onSaved={(video) => {
           setVideoDialog({ open: false });
           if (video) {
-            setSelectedTechniqueId(video.technique_id);
-            setSelectedModuleId(video.module_id);
+            if (video.technique_id) setSelectedTechniqueId(video.technique_id);
+            if (video.module_id) setSelectedModuleId(video.module_id);
           }
           router.refresh();
         }}

@@ -10,7 +10,7 @@ import { Dialog } from "@/components/ui/dialog";
 import { Alert } from "@/components/ui/feedback";
 import { VideoUploadProgress } from "./video-upload-progress";
 import { VideoUploadError } from "./video-upload-error";
-import { uploadVideoWithProgress, type UploadHandle } from "@/lib/api/videos";
+import { uploadVideoResumable, type UploadHandle } from "@/lib/api/videos";
 import { ApiClientError } from "@/lib/api/client";
 
 const MAX_BYTES = 5 * 1024 * 1024 * 1024;
@@ -124,18 +124,18 @@ export function VideoUploadDialog({
       return;
     }
 
-    const form = new FormData();
-    form.append("file", file);
-    form.append("title", title.trim() || file.name);
-    form.append("description", description.trim());
-    form.append("destination", destination);
-    if (destination === "library") form.append("module_id", moduleId);
-
     setUploading(true);
     setStartedAt(Date.now());
     setProgress({ loaded: 0, total: file.size, percentage: 0 });
-    const handle = uploadVideoWithProgress(form, (next) =>
-      setProgress(next),
+    const handle = uploadVideoResumable(
+      {
+        title: title.trim() || file.name,
+        description: description.trim() || null,
+        destination,
+        moduleId: destination === "library" ? moduleId : null,
+        file,
+      },
+      (next) => setProgress(next),
     );
     handleRef.current = handle;
 

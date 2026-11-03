@@ -8,5 +8,5 @@ export const PATCH = route<{ id: string }>(async (request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
   const data = updateModuleSchema.parse(await parseJson(request));
-  return jsonSuccess(updateModule(id, session.user.id, data));
+  return jsonSuccess(await updateModule(id, session.user.id, data));
 });

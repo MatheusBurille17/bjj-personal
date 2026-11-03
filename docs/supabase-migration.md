@@ -37,11 +37,11 @@ Status da migração do runtime local (`.data/db.json`) para o Supabase.
 - **Google OAuth + tokens do Drive**: migrados para o provider Google do
   Supabase Auth e para as tabelas `user_google_oauth`/`providers_oauth_tokens`
   (`lib/services/google-supabase-*.ts`).
-- **Armazenamento de vídeos do Drive**: `lib/services/google-drive.service.ts`
-  (pastas/configuração) e `lib/services/video-storage.service.ts` (vídeos,
-  sessões de upload, auditoria e migração) ainda usam o repositório local e
-  precisam ser migrados para o Supabase + upload resumable direto no Drive.
-  Enquanto isso, uploads/playback de vídeos não devem ser usados em produção.
+- **Armazenamento de vídeos do Drive**: migrado para `videos`,
+  `video_storage_config`, `drive_folder_mappings`, `video_upload_sessions`,
+  `video_access_audit` e `video_migration_jobs`. Upload usa sessão resumable
+  direta do navegador para o Drive; a migração Mux → Drive roda sob demanda em
+  lotes.
 - **Testes**: a suíte atual (`tests/`) foi escrita para o repositório síncrono
   local. Ela está temporariamente fora do `tsconfig` e precisa ser reescrita
   para o runtime Supabase (integração real ou clientes mockados).

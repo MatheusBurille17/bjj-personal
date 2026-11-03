@@ -108,7 +108,9 @@ export async function getTechniques(
     if (moduleResult.error) throw mapPostgrestError(moduleResult.error);
     if (videoResult.error) throw mapPostgrestError(videoResult.error);
     modules = moduleResult.data ?? [];
-    videos = videoResult.data ?? [];
+    videos = (videoResult.data ?? []).filter(
+      (item): item is { technique_id: string } => Boolean(item.technique_id),
+    );
   }
 
   const moduleCounts = countBy(modules, (item) => item.technique_id);
@@ -166,8 +168,8 @@ export async function getLibraryTree(
     (item) => includeArchived || item.status !== "archived",
   );
 
-  const moduleVideoCounts = countBy(allVideos, (item) => item.module_id);
-  const techniqueVideoCounts = countBy(allVideos, (item) => item.technique_id);
+  const moduleVideoCounts = countBy(allVideos, (item) => item.module_id ?? "");
+  const techniqueVideoCounts = countBy(allVideos, (item) => item.technique_id ?? "");
   const techniqueModuleCounts = countBy(allModules, (item) => item.technique_id);
 
   const videos: Record<string, Video[]> = {};
@@ -361,7 +363,7 @@ export async function getModules(
     .in("module_id", modules.map((item) => item.id));
   if (videoResult.error) throw mapPostgrestError(videoResult.error);
 
-  const counts = countBy(videoResult.data ?? [], (item) => item.module_id);
+  const counts = countBy(videoResult.data ?? [], (item) => item.module_id ?? "");
   return modules.map((moduleRecord) => ({
     ...moduleRecord,
     video_count: counts.get(moduleRecord.id) ?? 0,
@@ -725,8 +727,20 @@ export async function searchVideos(
   if (error) throw mapPostgrestError(error);
 
   const videos = data ?? [];
-  const moduleIds = Array.from(new Set(videos.map((item) => item.module_id)));
-  const techniqueIds = Array.from(new Set(videos.map((item) => item.technique_id)));
+  const moduleIds = Array.from(
+    new Set(
+      videos
+        .map((item) => item.module_id)
+        .filter((id): id is string => Boolean(id)),
+    ),
+  );
+  const techniqueIds = Array.from(
+    new Set(
+      videos
+        .map((item) => item.technique_id)
+        .filter((id): id is string => Boolean(id)),
+    ),
+  );
 
   const [modules, techniques] = await Promise.all([
     moduleIds.length > 0
@@ -745,8 +759,8 @@ export async function searchVideos(
 
   const withContext: VideoWithContext[] = videos.map((video) => ({
     ...video,
-    module_name: moduleNames.get(video.module_id) ?? "Módulo",
-    technique_name: techniqueNames.get(video.technique_id) ?? "Técnica",
+    module_name: moduleNames.get(video.module_id ?? "") ?? "Módulo",
+    technique_name: techniqueNames.get(video.technique_id ?? "") ?? "Técnica",
   }));
 
   return {

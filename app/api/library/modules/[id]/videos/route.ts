@@ -8,6 +8,6 @@ export const GET = route<{ id: string }>(async (request, context) => {
   const { id } = await context.params;
   const { searchParams } = new URL(request.url);
   return jsonSuccess(
-    getVideos(id, session.user.id, searchParams.get("includeArchived") === "true"),
+    await getVideos(id, session.user.id, searchParams.get("includeArchived") === "true"),
   );
 });

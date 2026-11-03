@@ -63,7 +63,7 @@ function errorRedirect(
 }
 
 export const GET = route(async (request) => {
-  const limit = checkRateLimit(`google-callback:${getClientIp(request)}`);
+  const limit = await checkRateLimit(`google-callback:${getClientIp(request)}`);
   if (!limit.allowed) return rateLimitResponse(limit);
 
   enforceHttpsInProduction(request);

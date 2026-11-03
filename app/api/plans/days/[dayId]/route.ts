@@ -14,7 +14,7 @@ export const PATCH = route<{ dayId: string }>(async (request, context) => {
   const session = await requireApiTeacher();
   const { dayId } = await context.params;
   const data = updatePlanDaySchema.parse(await parseJson(request));
-  return jsonSuccess(updatePlanDay(dayId, session.user.id, data));
+  return jsonSuccess(await updatePlanDay(dayId, session.user.id, data));
 });
 
 export const DELETE = route<{ dayId: string }>(async (_request, context) => {

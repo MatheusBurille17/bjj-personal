@@ -147,14 +147,18 @@ supabase db push
    adicione `https://SEU_DOMINIO/api/auth/google/callback` às Redirect URLs do
    Supabase. Defina `NEXT_PUBLIC_GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` (os
    mesmos do Supabase, usados no refresh do Drive), `GOOGLE_TOKEN_ENCRYPTION_KEY`
-   e `SUPABASE_SECRET_KEY`. O passo a passo está em
+   e `SUPABASE_SECRET_KEY` (necessária para auditoria e para o aluno assistir
+   vídeos do Drive do professor). O passo a passo está em
    [`docs/google-social-authentication.md`](docs/google-social-authentication.md).
 7. Para armazenamento de vídeos, adicione `GOOGLE_OAUTH_SCOPES` (padrão
    `openid email profile https://www.googleapis.com/auth/drive.file`),
-   `PLAYBACK_TOKEN_SECRET` e, opcionalmente, os limites de retry. As rotas
-   legadas do Drive (`NEXT_PUBLIC_GOOGLE_DRIVE_REDIRECT_URI`) só são necessárias
-   se você usar `/api/google-drive/oauth/*` diretamente. Veja
+   `PLAYBACK_TOKEN_SECRET` e, opcionalmente, os limites de retry. O upload é
+   resumable direto do navegador para o Drive (sem o limite de 4,5 MB da
+   Vercel). As rotas legadas do Drive (`NEXT_PUBLIC_GOOGLE_DRIVE_REDIRECT_URI`)
+   só são necessárias se você usar `/api/google-drive/oauth/*` diretamente. Veja
    [`docs/google-drive-video-storage.md`](docs/google-drive-video-storage.md).
+8. Opcional: defina `UPSTASH_REDIS_REST_URL` e `UPSTASH_REDIS_REST_TOKEN` para
+   rate limit compartilhado entre instâncias serverless.
 
 > O runtime usa Supabase (Postgres, Auth e RLS). O schema e as políticas estão em `supabase/migrations`; o passo a passo da migração e o que ainda falta estão em [`docs/supabase-migration.md`](docs/supabase-migration.md).
 

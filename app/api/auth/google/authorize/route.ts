@@ -25,7 +25,7 @@ type AuthorizationPreparation =
 async function prepareAuthorization(
   request: Request,
 ): Promise<AuthorizationPreparation> {
-  const limit = checkRateLimit(`google-authorize:${getClientIp(request)}`);
+  const limit = await checkRateLimit(`google-authorize:${getClientIp(request)}`);
   if (!limit.allowed) {
     return { rateLimited: true, limit };
   }

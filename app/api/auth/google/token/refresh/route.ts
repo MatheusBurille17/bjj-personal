@@ -11,7 +11,7 @@ import { refreshSupabaseGoogleToken } from "@/lib/services/google-supabase-token
 export const runtime = "nodejs";
 
 export const POST = route(async (request) => {
-  const limit = checkRateLimit(`google-token-refresh:${getClientIp(request)}`);
+  const limit = await checkRateLimit(`google-token-refresh:${getClientIp(request)}`);
   if (!limit.allowed) return rateLimitResponse(limit);
 
   enforceHttpsInProduction(request);

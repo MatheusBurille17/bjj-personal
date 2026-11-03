@@ -36,9 +36,12 @@ export interface ModuleWithCounts extends Module {
 
 export interface Video {
   id: string;
-  teacher_id: string;
-  module_id: string;
-  technique_id: string;
+  /** Nulo em vídeos pessoais (armazenados no Drive do aluno). */
+  teacher_id: string | null;
+  /** Nulo em vídeos pessoais. */
+  module_id: string | null;
+  /** Nulo em vídeos pessoais. */
+  technique_id: string | null;
   title: string;
   description: string | null;
   provider: string;

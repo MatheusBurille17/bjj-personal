@@ -23,6 +23,7 @@ const videoApi = vi.hoisted(() => ({
   fetchVideoAudit: vi.fn(),
   shareVideo: vi.fn(),
   uploadVideoWithProgress: vi.fn(),
+  uploadVideoResumable: vi.fn(),
 }));
 
 vi.mock("next/navigation", () => ({ useRouter: () => routerState }));
@@ -188,7 +189,7 @@ describe("VideoUploadProgress e VideoUploadError", () => {
 
 describe("VideoUploadDialog", () => {
   it("valida, envia arquivo e chama onUploaded", async () => {
-    videoApi.uploadVideoWithProgress.mockReturnValue({
+    videoApi.uploadVideoResumable.mockReturnValue({
       promise: Promise.resolve({ video_id: "v1" }),
       abort: vi.fn(),
     });
@@ -223,7 +224,7 @@ describe("VideoUploadDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: /Enviar/i }));
 
     await waitFor(() =>
-      expect(videoApi.uploadVideoWithProgress).toHaveBeenCalled(),
+      expect(videoApi.uploadVideoResumable).toHaveBeenCalled(),
     );
     await waitFor(() => expect(onUploaded).toHaveBeenCalled());
     expect(onOpenChange).toHaveBeenCalledWith(false);
@@ -240,7 +241,7 @@ describe("VideoUploadDialog", () => {
       target: { files: [invalid] },
     });
     expect(screen.getByText(/Formato não suportado/i)).toBeInTheDocument();
-    expect(videoApi.uploadVideoWithProgress).not.toHaveBeenCalled();
+    expect(videoApi.uploadVideoResumable).not.toHaveBeenCalled();
   });
 });
 

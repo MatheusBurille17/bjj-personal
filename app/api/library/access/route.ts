@@ -23,13 +23,13 @@ export const GET = route(async (request) => {
   const { searchParams } = new URL(request.url);
   const enrollmentId = searchParams.get("enrollment_id");
   if (!enrollmentId) return jsonSuccess([]);
-  return jsonSuccess(getAccessForEnrollment(enrollmentId, session.user.id));
+  return jsonSuccess(await getAccessForEnrollment(enrollmentId, session.user.id));
 });
 
 export const POST = route(async (request) => {
   const session = await requireApiTeacher();
   const data = grantSchema.parse(await parseJson(request));
   return jsonCreated(
-    grantTechniqueAccess(session.user.id, data.enrollment_id, data.technique_id),
+    await grantTechniqueAccess(session.user.id, data.enrollment_id, data.technique_id),
   );
 });

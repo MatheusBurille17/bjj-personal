@@ -8,6 +8,6 @@ export const GET = route<{ id: string }>(async (request, context) => {
   const { id } = await context.params;
   const { searchParams } = new URL(request.url);
   return jsonSuccess(
-    getModules(id, session.user.id, searchParams.get("includeArchived") === "true"),
+    await getModules(id, session.user.id, searchParams.get("includeArchived") === "true"),
   );
 });

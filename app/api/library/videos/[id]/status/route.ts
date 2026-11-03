@@ -9,5 +9,5 @@ export const POST = route<{ id: string }>(async (request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
   const data = videoStatusSchema.parse(await parseJson(request));
-  return jsonSuccess(setVideoStatus(id, session.user.id, data.status));
+  return jsonSuccess(await setVideoStatus(id, session.user.id, data.status));
 });

@@ -14,7 +14,7 @@ export const PATCH = route<{ id: string }>(async (request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
   const data = updateWeeklySlotSchema.parse(await parseJson(request));
-  return jsonSuccess(updateWeeklySlot(id, session.user.id, data));
+  return jsonSuccess(await updateWeeklySlot(id, session.user.id, data));
 });
 
 export const DELETE = route<{ id: string }>(async (_request, context) => {

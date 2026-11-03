@@ -4,11 +4,10 @@ Integração de armazenamento de vídeos no Google Drive, com modo híbrido
 Mux/demo, upload direto para o Drive do instrutor/aluno, URLs de reprodução
 efêmeras, auditoria de acessos e compartilhamento nativo do Drive.
 
-> **Estado no MVP:** serviço, endpoints, UI, cache, retry/circuit breaker,
-> upload em chunks, migração e testes estão implementados. Sem credenciais
-> Google reais, a conexão do Drive retorna erro de configuração; os testes usam
-> `fetch` e o cliente Drive mockados. Deploy em staging/produção (11.14/11.15)
-> depende de infraestrutura externa.
+> **Estado:** serviço, endpoints, UI, cache, retry/circuit breaker, upload
+> resumable direto do navegador, persistência no Supabase e migração sob demanda
+> estão implementados. Sem credenciais Google reais, a conexão do Drive retorna
+> erro de configuração; os testes usam `fetch` e o cliente Drive mockados.
 
 ---
 
@@ -81,6 +80,9 @@ quiser.
 | `GOOGLE_DRIVE_MAX_RETRIES` | não | Tentativas (padrão 3) |
 | `GOOGLE_DRIVE_CIRCUIT_BREAKER_MS` | não | Pausa após 5 falhas (padrão 5min) |
 | `PLAYBACK_TOKEN_SECRET` | produção | Segredo HMAC das URLs de reprodução (fallback `AUTH_SECRET`) |
+| `SUPABASE_SECRET_KEY` | produção | service role: auditoria e leitura dos tokens do Drive do proprietário (ex.: aluno vendo vídeo do professor) |
+| `UPSTASH_REDIS_REST_URL` | opcional | Rate limit compartilhado entre instâncias |
+| `UPSTASH_REDIS_REST_TOKEN` | opcional | Token do Upstash Redis |
 
 Com o provider Google do Supabase Auth, o padrão é o escopo
 `https://www.googleapis.com/auth/drive.file`, que dá acesso apenas aos arquivos
@@ -114,11 +116,11 @@ Formato padrão: `{ data, error, meta }`.
 
 | Método | Rota | Descrição |
 |---|---|---|
-| POST | `/api/videos/upload` | Upload multipart (`file`, `title`, `destination`, `module_id`) |
-| POST | `/api/videos/upload/initialize` | Inicia sessão em chunks (`file_name`, `total_bytes`, ...) |
-| POST | `/api/videos/upload/:sessionId/chunk?chunk_index=N` | Envia bytes de um chunk |
-| POST | `/api/videos/upload/:sessionId/complete` | Valida, envia ao Drive e cria vídeo |
-| POST | `/api/videos/upload/:sessionId/cancel` | Cancela e descarta chunks |
+| POST | `/api/videos/upload` | Legado: upload multipart (limitado a ~4,5 MB na Vercel) |
+| POST | `/api/videos/upload/initialize` | Cria a sessão resumable e devolve `upload_url` |
+| PUT | `upload_url` (Google) | O **navegador** envia o arquivo direto ao Drive |
+| POST | `/api/videos/upload/:sessionId/complete` | Valida o arquivo no Drive e cria o vídeo no Supabase |
+| POST | `/api/videos/upload/:sessionId/cancel` | Cancela a sessão |
 
 Exemplo de upload:
 
@@ -228,9 +230,12 @@ mensagem amigável.
 - Listagem de pasta: cache por 5min.
 - Retry exponencial (base configurável) para 429/5xx/timeout, até 3 tentativas.
 - Circuit breaker abre após 5 falhas consecutivas e pausa por 5min.
-- Upload em chunks de 5MB com progresso por polling (WebSocket é opcional e
-  não foi necessário no MVP).
-- Timeout de 30s para chamadas de metadados/API e 30min para upload.
+- Upload **resumable direto do navegador** para o Google Drive: o corpo não
+  passa pela Vercel e não sofre o limite de 4,5 MB por requisição. O servidor
+  apenas cria a sessão e finaliza o registro.
+- Progresso real via `XMLHttpRequest.upload.onprogress`; sem WebSocket.
+- Timeout de 30s para chamadas de metadados/API e 30min para upload server-side
+  (migração).
 
 ---
 
@@ -259,9 +264,15 @@ mensagem amigável.
 
 ## Migração Mux → Google Drive
 
-Use `npm run migrate:videos` (com `MIGRATION_SESSION_COOKIE` de um instrutor) ou
-`POST /api/videos/migrate` para criar um job assíncrono em processo. Para cada
-vídeo Mux do instrutor:
+Use `npm run migrate:videos` (com `MIGRATION_SESSION_COOKIE` de um instrutor) ou:
+
+1. `POST /api/videos/migrate` cria o job (`pending`);
+2. `POST /api/videos/migrate/:jobId` processa **um vídeo por chamada**
+   (serverless-friendly) e retorna o progresso;
+3. repita a chamada até `status` ser `completed`/`failed`;
+4. `GET /api/videos/migrate/:jobId` consulta o estado.
+
+Para cada vídeo Mux do instrutor o worker:
 
 1. baixa o arquivo de origem (`playback_url`/demo);
 2. envia para a pasta do módulo no Drive;
@@ -269,8 +280,9 @@ vídeo Mux do instrutor:
    metadados, preservando título, descrição e associações;
 4. registra sucesso/erro no job e auditoria.
 
-Em produção, substitua o `queueMicrotask` por uma fila (Bull/Redis) para
-execução distribuída e retry.
+Não há mais `queueMicrotask`: a execução é sob demanda, então funciona na
+Vercel. Se quiser execução automática, chame o endpoint de run por um Cron Job
+ou use uma fila externa (Bull/Redis).
 
 ---
 
@@ -284,7 +296,8 @@ execução distribuída e retry.
 | `permission_denied` | Pasta/arquivo não compartilhado | Compartilhe no Drive com o e-mail do aluno |
 | `quota_exceeded` | Drive sem espaço | Libere espaço ou faça upgrade |
 | `circuit_open` | Muitas falhas consecutivas | Aguarde 5min ou reinicie o processo |
-| Upload lento | Arquivo grande/rede | Use upload em chunks e verifique a conexão |
+| Upload lento | Arquivo grande/rede | O envio é direto ao Drive; verifique a conexão do usuário |
+| Upload falha antes de chegar ao Drive | CORS/rede bloqueando o PUT | Verifique o console do navegador; o fluxo resumable usa a URL do Google |
 
 ---
 

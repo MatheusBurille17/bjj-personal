@@ -676,7 +676,8 @@ export async function getStudentLibraryTechniques(
   const videoCounts = new Map<string, number>();
   for (const item of videos.data ?? []) {
     if (item.status === "archived") continue;
-    videoCounts.set(item.technique_id, (videoCounts.get(item.technique_id) ?? 0) + 1);
+    const techniqueId = item.technique_id ?? "";
+    videoCounts.set(techniqueId, (videoCounts.get(techniqueId) ?? 0) + 1);
   }
 
   const names = await teacherNames(

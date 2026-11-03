@@ -14,6 +14,8 @@ export interface RateLimitResult {
   /** Epoch em milissegundos em que a janela reinicia. */
   resetAt: number;
   retryAfterSeconds: number;
+  /** Backend usado (útil em logs/testes). */
+  backend?: "memory" | "upstash";
 }
 
 interface Bucket {
@@ -44,20 +46,12 @@ function pruneIfNeeded(now: number): void {
   }
 }
 
-/**
- * Rate limit em memória (janela fixa) por chave — normalmente IP + rota.
- * Em produção serverless, substitua por Redis/Upstash para compartilhar estado
- * entre instâncias; a interface pública permanece a mesma.
- */
-export function checkRateLimit(
+function checkMemory(
   key: string,
-  options: RateLimitOptions = {},
+  limit: number,
+  windowMs: number,
+  now: number,
 ): RateLimitResult {
-  const config = getRateLimitConfig();
-  const limit = options.limit ?? config.limit;
-  const windowMs = options.windowMs ?? config.windowMs;
-  const now = options.now ?? Date.now();
-
   pruneIfNeeded(now);
   const existing = buckets.get(key);
 
@@ -70,6 +64,7 @@ export function checkRateLimit(
       remaining: Math.max(0, limit - 1),
       resetAt,
       retryAfterSeconds: 0,
+      backend: "memory",
     };
   }
 
@@ -83,7 +78,94 @@ export function checkRateLimit(
     retryAfterSeconds: allowed
       ? 0
       : Math.max(1, Math.ceil((existing.resetAt - now) / 1000)),
+    backend: "memory",
   };
+}
+
+async function upstashPipeline(
+  url: string,
+  token: string,
+  commands: string[][],
+): Promise<Array<{ result?: unknown; error?: string }>> {
+  const response = await fetch(`${url.replace(/\/$/, "")}/pipeline`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(commands),
+    signal: AbortSignal.timeout(2_000),
+  });
+  if (!response.ok) {
+    throw new Error(`Upstash respondeu ${response.status}`);
+  }
+  return (await response.json()) as Array<{ result?: unknown; error?: string }>;
+}
+
+async function checkUpstash(
+  key: string,
+  limit: number,
+  windowMs: number,
+  now: number,
+): Promise<RateLimitResult> {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) {
+    return checkMemory(key, limit, windowMs, now);
+  }
+
+  const results = await upstashPipeline(url, token, [
+    ["INCR", key],
+    ["PEXPIRE", key, String(windowMs), "NX"],
+  ]);
+  const failed = results.find((item) => item.error);
+  if (failed) throw new Error(failed.error);
+
+  const count = Number(results[0]?.result ?? 0);
+  if (!Number.isFinite(count) || count <= 0) {
+    throw new Error("Upstash retornou contador inválido");
+  }
+
+  const allowed = count <= limit;
+  // O TTL exato não é retornado pelo pipeline; usamos a janela configurada.
+  const resetAt = now + windowMs;
+  return {
+    allowed,
+    limit,
+    remaining: Math.max(0, limit - count),
+    resetAt,
+    retryAfterSeconds: allowed ? 0 : Math.max(1, Math.ceil(windowMs / 1000)),
+    backend: "upstash",
+  };
+}
+
+/**
+ * Rate limit por chave (normalmente IP + rota).
+ *
+ * Usa Upstash Redis quando `UPSTASH_REDIS_REST_URL` e
+ * `UPSTASH_REDIS_REST_TOKEN` estão definidos; caso contrário, mantém o
+ * fallback em memória por instância.
+ */
+export async function checkRateLimit(
+  key: string,
+  options: RateLimitOptions = {},
+): Promise<RateLimitResult> {
+  const config = getRateLimitConfig();
+  const limit = options.limit ?? config.limit;
+  const windowMs = options.windowMs ?? config.windowMs;
+  const now = options.now ?? Date.now();
+
+  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+    try {
+      return await checkUpstash(key, limit, windowMs, now);
+    } catch (error) {
+      console.warn("[rate-limit] Upstash indisponível; usando memória", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return checkMemory(key, limit, windowMs, now);
 }
 
 export function resetRateLimitStore(): void {

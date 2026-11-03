@@ -10,7 +10,7 @@ export const GET = route(async (request) => {
   const pageSize = Number(url.searchParams.get("pageSize") ?? "20");
 
   return jsonSuccess(
-    listVideoAccessAudit(session.user.id, session.activeRole, {
+    await listVideoAccessAudit(session.user.id, session.activeRole, {
       videoId: url.searchParams.get("video_id") ?? undefined,
       userId: url.searchParams.get("user_id") ?? undefined,
       dateFrom: url.searchParams.get("date_from") ?? undefined,

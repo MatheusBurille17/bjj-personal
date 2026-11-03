@@ -5,5 +5,5 @@ export const runtime = "nodejs";
 
 export const GET = route(async () => {
   const session = await requireApiStudent();
-  return jsonSuccess(getStudentDashboard(session.user.id));
+  return jsonSuccess(await getStudentDashboard(session.user.id));
 });

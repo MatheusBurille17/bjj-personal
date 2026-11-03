@@ -17,14 +17,14 @@ export const runtime = "nodejs";
 export const GET = route<{ id: string }>(async (_request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
-  return jsonSuccess(getPlanDetail(id, session.user.id));
+  return jsonSuccess(await getPlanDetail(id, session.user.id));
 });
 
 export const PATCH = route<{ id: string }>(async (request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
   const data = updatePlanSchema.parse(await parseJson(request));
-  return jsonSuccess(updatePlan(id, session.user.id, data));
+  return jsonSuccess(await updatePlan(id, session.user.id, data));
 });
 
 export const DELETE = route<{ id: string }>(async (_request, context) => {

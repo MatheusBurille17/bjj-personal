@@ -14,12 +14,12 @@ export const GET = route(async (request) => {
   const session = await requireApiTeacher();
   const { searchParams } = new URL(request.url);
   return jsonSuccess(
-    getWeeklySlots(session.user.id, searchParams.get("enrollment_id") ?? undefined),
+    await getWeeklySlots(session.user.id, searchParams.get("enrollment_id") ?? undefined),
   );
 });
 
 export const POST = route(async (request) => {
   const session = await requireApiTeacher();
   const data = createWeeklySlotSchema.parse(await parseJson(request));
-  return jsonCreated(createWeeklySlot(session.user.id, data));
+  return jsonCreated(await createWeeklySlot(session.user.id, data));
 });

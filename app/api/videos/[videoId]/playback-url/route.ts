@@ -29,7 +29,7 @@ export const GET = route<{ videoId: string }>(async (request, context) => {
       provider: result.provider,
     });
   } catch (error) {
-    recordVideoAccess(videoId, session.user.id, {
+    await recordVideoAccess(videoId, session.user.id, {
       action: "playback",
       success: false,
       ip: getClientIp(request),

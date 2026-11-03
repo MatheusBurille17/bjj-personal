@@ -13,12 +13,12 @@ export const runtime = "nodejs";
 export const GET = route<{ id: string }>(async (_request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
-  return jsonSuccess(getPlanEnrollments(id, session.user.id));
+  return jsonSuccess(await getPlanEnrollments(id, session.user.id));
 });
 
 export const POST = route<{ id: string }>(async (request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
   const data = grantPlanAccessSchema.parse(await parseJson(request));
-  return jsonCreated(grantPlanAccess(id, session.user.id, data.enrollment_id));
+  return jsonCreated(await grantPlanAccess(id, session.user.id, data.enrollment_id));
 });

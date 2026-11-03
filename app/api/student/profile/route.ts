@@ -17,7 +17,7 @@ const studentProfileSchema = z.object({
 
 export const GET = route(async () => {
   const session = await requireApiStudent();
-  return jsonSuccess(getStudentProfile(session.user.id));
+  return jsonSuccess(await getStudentProfile(session.user.id));
 });
 
 export const PATCH = route(async (request) => {

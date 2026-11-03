@@ -7,5 +7,5 @@ export const runtime = "nodejs";
 export const POST = route(async (request) => {
   const session = await requireApiTeacher();
   const data = createVideoSchema.parse(await parseJson(request));
-  return jsonCreated(createVideo(session.user.id, data));
+  return jsonCreated(await createVideo(session.user.id, data));
 });

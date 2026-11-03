@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type {
   DriveConnectionStatus,
   DriveFileMetadata,
@@ -8,8 +7,9 @@ import type {
   PlaybackUrlResult,
   VideoStorageConfig,
 } from "@/types/google-drive";
-import { getDb, mutate, nowIso } from "@/lib/db/store";
 import { ApiError } from "@/lib/middleware/errors";
+import { createClient } from "@/lib/supabase/server";
+import { mapPostgrestError } from "@/lib/supabase/errors";
 import {
   createPermission,
   deleteFile,
@@ -24,9 +24,8 @@ import {
 } from "./google-drive-client";
 import {
   disconnectDriveAccount,
-  getValidDriveAccessToken,
   getDriveConnectionStatus,
-  markDriveSync,
+  getValidDriveAccessToken,
 } from "./google-drive-token.service";
 import { validateVideoFile } from "./video-file-validation";
 import { buildPlaybackUrl } from "./playback-token.service";
@@ -76,66 +75,83 @@ export function getRootFolderName(): string {
   return process.env.GOOGLE_DRIVE_FOLDER_ROOT || "Plataforma de Treinamento";
 }
 
-function getConfig(userId: string): VideoStorageConfig | null {
-  return (
-    getDb().video_storage_config.find((item) => item.user_id === userId) ?? null
-  );
+async function getConfig(userId: string): Promise<VideoStorageConfig | null> {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("video_storage_config")
+    .select("*")
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (error) throw mapPostgrestError(error);
+  return (data as VideoStorageConfig | null) ?? null;
 }
 
-function findMapping(
+function mappingEntityId(entityId?: string | null): string {
+  // O índice único (user_id, folder_type, entity_id) não lida bem com NULL.
+  return entityId ?? "";
+}
+
+async function findMapping(
   userId: string,
   folderType: DriveFolderType,
   entityId?: string | null,
-): DriveFolderMapping | null {
-  return (
-    getDb().drive_folder_mappings.find(
-      (mapping) =>
-        mapping.user_id === userId &&
-        mapping.folder_type === folderType &&
-        (entityId ? mapping.entity_id === entityId : !mapping.entity_id),
-    ) ?? null
-  );
+): Promise<DriveFolderMapping | null> {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("drive_folder_mappings")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("folder_type", folderType)
+    .eq("entity_id", mappingEntityId(entityId))
+    .maybeSingle();
+  if (error) throw mapPostgrestError(error);
+  return (data as DriveFolderMapping | null) ?? null;
 }
 
-function storeMapping(input: {
+async function storeMapping(input: {
   userId: string;
   folderType: DriveFolderType;
   entityId?: string | null;
   name: string;
   folderId: string;
   parentId?: string | null;
-}): DriveFolderMapping {
-  return mutate((db) => {
-    const existing = db.drive_folder_mappings.find(
-      (mapping) =>
-        mapping.user_id === input.userId &&
-        mapping.folder_type === input.folderType &&
-        (input.entityId
-          ? mapping.entity_id === input.entityId
-          : !mapping.entity_id),
-    );
-    if (existing) {
-      existing.folder_name = input.name;
-      existing.google_drive_folder_id = input.folderId;
-      existing.parent_folder_id = input.parentId ?? null;
-      return existing;
-    }
-    const mapping: DriveFolderMapping = {
-      id: randomUUID(),
+}): Promise<DriveFolderMapping> {
+  const supabase = await createClient();
+  const entityId = mappingEntityId(input.entityId);
+  const existing = await findMapping(input.userId, input.folderType, input.entityId);
+
+  if (existing) {
+    const { data, error } = await supabase
+      .from("drive_folder_mappings")
+      .update({
+        folder_name: input.name,
+        google_drive_folder_id: input.folderId,
+        parent_folder_id: input.parentId ?? null,
+      })
+      .eq("id", existing.id)
+      .select("*")
+      .single();
+    if (error) throw mapPostgrestError(error);
+    return data as DriveFolderMapping;
+  }
+
+  const { data, error } = await supabase
+    .from("drive_folder_mappings")
+    .insert({
       user_id: input.userId,
       folder_type: input.folderType,
-      entity_id: input.entityId ?? null,
+      entity_id: entityId,
       folder_name: input.name,
       google_drive_folder_id: input.folderId,
       parent_folder_id: input.parentId ?? null,
-      created_at: nowIso(),
-    };
-    db.drive_folder_mappings.push(mapping);
-    return mapping;
-  });
+    })
+    .select("*")
+    .single();
+  if (error) throw mapPostgrestError(error);
+  return data as DriveFolderMapping;
 }
 
-function upsertConfig(
+async function upsertConfig(
   userId: string,
   folders: {
     root: string;
@@ -143,23 +159,32 @@ function upsertConfig(
     archive: string;
     personal?: string | null;
   },
-): VideoStorageConfig {
-  return mutate((db) => {
-    const timestamp = nowIso();
-    const existing = db.video_storage_config.find(
-      (item) => item.user_id === userId,
-    );
-    if (existing) {
-      existing.root_folder_id = folders.root;
-      existing.library_folder_id = folders.library;
-      existing.archive_folder_id = folders.archive;
-      existing.personal_folder_id = folders.personal ?? existing.personal_folder_id;
-      existing.last_sync_at = timestamp;
-      existing.updated_at = timestamp;
-      return existing;
-    }
-    const config: VideoStorageConfig = {
-      id: randomUUID(),
+): Promise<VideoStorageConfig> {
+  const supabase = await createClient();
+  const timestamp = new Date().toISOString();
+  const existing = await getConfig(userId);
+
+  if (existing) {
+    const { data, error } = await supabase
+      .from("video_storage_config")
+      .update({
+        root_folder_id: folders.root,
+        library_folder_id: folders.library,
+        archive_folder_id: folders.archive,
+        personal_folder_id: folders.personal ?? existing.personal_folder_id,
+        last_sync_at: timestamp,
+        updated_at: timestamp,
+      })
+      .eq("user_id", userId)
+      .select("*")
+      .single();
+    if (error) throw mapPostgrestError(error);
+    return data as VideoStorageConfig;
+  }
+
+  const { data, error } = await supabase
+    .from("video_storage_config")
+    .insert({
       user_id: userId,
       provider: "google_drive",
       root_folder_id: folders.root,
@@ -167,12 +192,22 @@ function upsertConfig(
       archive_folder_id: folders.archive,
       personal_folder_id: folders.personal ?? null,
       last_sync_at: timestamp,
-      created_at: timestamp,
       updated_at: timestamp,
-    };
-    db.video_storage_config.push(config);
-    return config;
-  });
+    })
+    .select("*")
+    .single();
+  if (error) throw mapPostgrestError(error);
+  return data as VideoStorageConfig;
+}
+
+async function markSync(userId: string): Promise<void> {
+  const supabase = await createClient();
+  const timestamp = new Date().toISOString();
+  const { error } = await supabase
+    .from("video_storage_config")
+    .update({ last_sync_at: timestamp, updated_at: timestamp })
+    .eq("user_id", userId);
+  if (error) throw mapPostgrestError(error);
 }
 
 /**
@@ -189,7 +224,7 @@ export async function ensureLibraryStructure(userId: string): Promise<{
   const accessToken = await getValidDriveAccessToken(userId);
   const rootName = getRootFolderName();
 
-  const cachedConfig = getConfig(userId);
+  const cachedConfig = await getConfig(userId);
   if (
     cachedConfig?.root_folder_id &&
     cachedConfig.library_folder_id &&
@@ -209,34 +244,34 @@ export async function ensureLibraryStructure(userId: string): Promise<{
   const archive = await ensureFolder(accessToken, "Arquivo", root.id);
   const personal = await ensureFolder(accessToken, "Vídeos Pessoais");
 
-  const config = upsertConfig(userId, {
+  const config = await upsertConfig(userId, {
     root: root.id,
     library: library.id,
     archive: archive.id,
     personal: personal.id,
   });
 
-  storeMapping({
+  await storeMapping({
     userId,
     folderType: "root",
     name: rootName,
     folderId: root.id,
   });
-  storeMapping({
+  await storeMapping({
     userId,
     folderType: "library",
     name: "Biblioteca",
     folderId: library.id,
     parentId: root.id,
   });
-  storeMapping({
+  await storeMapping({
     userId,
     folderType: "archive",
     name: "Arquivo",
     folderId: archive.id,
     parentId: root.id,
   });
-  storeMapping({
+  await storeMapping({
     userId,
     folderType: "personal",
     name: "Vídeos Pessoais",
@@ -256,7 +291,7 @@ export async function createTechniqueFolderIfNeeded(
   techniqueId: string,
   techniqueName: string,
 ): Promise<string> {
-  const mapping = findMapping(userId, "technique", techniqueId);
+  const mapping = await findMapping(userId, "technique", techniqueId);
   if (mapping) return mapping.google_drive_folder_id;
 
   const accessToken = await getValidDriveAccessToken(userId);
@@ -266,7 +301,7 @@ export async function createTechniqueFolderIfNeeded(
     techniqueName,
     structure.libraryFolderId,
   );
-  storeMapping({
+  await storeMapping({
     userId,
     folderType: "technique",
     entityId: techniqueId,
@@ -283,18 +318,24 @@ export async function createModuleFolderIfNeeded(
   moduleId: string,
   moduleName: string,
 ): Promise<string> {
-  const mapping = findMapping(userId, "module", moduleId);
+  const mapping = await findMapping(userId, "module", moduleId);
   if (mapping) return mapping.google_drive_folder_id;
+
+  const supabase = await createClient();
+  const { data: technique } = await supabase
+    .from("techniques")
+    .select("name")
+    .eq("id", techniqueId)
+    .maybeSingle();
 
   const accessToken = await getValidDriveAccessToken(userId);
   const techniqueFolderId = await createTechniqueFolderIfNeeded(
     userId,
     techniqueId,
-    getDb().techniques.find((item) => item.id === techniqueId)?.name ??
-      "Técnica",
+    technique?.name ?? "Técnica",
   );
   const folder = await ensureFolder(accessToken, moduleName, techniqueFolderId);
-  storeMapping({
+  await storeMapping({
     userId,
     folderType: "module",
     entityId: moduleId,
@@ -310,17 +351,25 @@ export async function getArchiveFolderId(userId: string): Promise<string> {
   return structure.archiveFolderId;
 }
 
-function folderForUpload(
+export async function folderForUpload(
   userId: string,
   destination: "library" | "personal",
   techniqueId?: string | null,
   moduleId?: string | null,
 ): Promise<string> {
   if (destination === "personal") {
-    return ensureLibraryStructure(userId).then((structure) => structure.personalFolderId);
+    const structure = await ensureLibraryStructure(userId);
+    return structure.personalFolderId;
   }
+
+  const supabase = await createClient();
+
   if (moduleId) {
-    const moduleRecord = getDb().modules.find((item) => item.id === moduleId);
+    const { data: moduleRecord } = await supabase
+      .from("modules")
+      .select("id, name, technique_id")
+      .eq("id", moduleId)
+      .maybeSingle();
     if (moduleRecord) {
       return createModuleFolderIfNeeded(
         userId,
@@ -330,17 +379,22 @@ function folderForUpload(
       );
     }
   }
+
   if (techniqueId) {
-    const technique = getDb().techniques.find((item) => item.id === techniqueId);
+    const { data: technique } = await supabase
+      .from("techniques")
+      .select("name")
+      .eq("id", techniqueId)
+      .maybeSingle();
     return createTechniqueFolderIfNeeded(
       userId,
       techniqueId,
       technique?.name ?? "Técnica",
     );
   }
-  return ensureLibraryStructure(userId).then(
-    (structure) => structure.libraryFolderId,
-  );
+
+  const structure = await ensureLibraryStructure(userId);
+  return structure.libraryFolderId;
 }
 
 /** Valida e envia o arquivo diretamente para a pasta correta do Drive. */
@@ -394,7 +448,7 @@ export async function uploadVideoFile(
     fileName: metadata.name,
     size: metadata.size ? Number(metadata.size) : file.size,
     mimeType: metadata.mimeType,
-    createdAt: metadata.createdTime ?? nowIso(),
+    createdAt: metadata.createdTime ?? new Date().toISOString(),
     durationSeconds: metadata.videoMediaMetadata?.durationMillis
       ? Math.round(metadata.videoMediaMetadata.durationMillis / 1000)
       : null,
@@ -403,7 +457,7 @@ export async function uploadVideoFile(
   };
 
   putCache(metadataCache, `${userId}:${result.fileId}`, metadata, METADATA_TTL_MS);
-  await markDriveSync(userId);
+  await markSync(userId);
   return result;
 }
 
@@ -431,7 +485,12 @@ export async function checkPermission(
   const cachedValue = cached(permissionCache, cacheKey);
   if (cachedValue !== null) return cachedValue;
 
-  const requester = getDb().profiles.find((profile) => profile.id === userId);
+  const supabase = await createClient();
+  const { data: requester } = await supabase
+    .from("profiles")
+    .select("email")
+    .eq("id", userId)
+    .maybeSingle();
   const email = requester?.email;
   if (!email) return false;
 
@@ -474,15 +533,13 @@ export async function updateDriveFileMetadata(
   input: { name?: string; description?: string | null },
 ): Promise<DriveFileMetadata> {
   const accessToken = await getValidDriveAccessToken(userId);
-  const metadata = await updateFileMetadata(
-    accessToken,
-    fileId,
-    input,
+  const metadata = await updateFileMetadata(accessToken, fileId, input);
+  putCache(
+    metadataCache,
+    `${userId}:${fileId}`,
+    metadata,
+    METADATA_TTL_MS,
   );
-  metadataCache.set(`${userId}:${fileId}`, {
-    value: metadata,
-    expiresAt: Date.now() + METADATA_TTL_MS,
-  });
   return metadata;
 }
 
@@ -588,3 +645,5 @@ export async function ensureModuleStorage(
   const archiveFolderId = await getArchiveFolderId(userId);
   return { techniqueFolderId, moduleFolderId, archiveFolderId };
 }
+
+

@@ -7,7 +7,7 @@ export const GET = route(async (request) => {
   const session = await requireApiStudent();
   const { searchParams } = new URL(request.url);
   return jsonSuccess(
-    getStudentTrainingPlans(
+    await getStudentTrainingPlans(
       session.user.id,
       searchParams.get("enrollment_id") ?? undefined,
     ),

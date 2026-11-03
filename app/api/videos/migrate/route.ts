@@ -20,7 +20,7 @@ export const POST = route(async (request) => {
   const videoIds = Array.isArray(body.video_ids)
     ? body.video_ids.filter((id): id is string => typeof id === "string")
     : undefined;
-  const job = startMigrationJob(session.user.id, videoIds);
+  const job = await startMigrationJob(session.user.id, videoIds);
   return jsonCreated({
     migrationId: job.id,
     status: job.status,

@@ -6,15 +6,18 @@ import type {
   VideoMigrationJob,
   VideoUploadSession,
 } from "@/types/google-drive";
-import { getDb, mutate, nowIso } from "@/lib/db/store";
-import { ApiError, buildPagination, paginate } from "@/lib/middleware/errors";
+import { ApiError, buildPagination } from "@/lib/middleware/errors";
 import { DEMO_VIDEO_URL } from "@/lib/db/seed";
 import { buildSignedPlaybackUrl, signMuxPlaybackToken } from "@/lib/mux/playback";
 import { isMuxConfigured } from "@/lib/mux/client";
+import { createClient } from "@/lib/supabase/server";
+import { createAdminClient, isAdminClientAvailable } from "@/lib/supabase/admin";
+import { mapPostgrestError } from "@/lib/supabase/errors";
 import {
   createDrivePlaybackUrl,
   createModuleFolderIfNeeded,
   deleteVideoFile,
+  folderForUpload,
   getArchiveFolderId,
   getDriveStatus,
   getVideoMetadata as getDriveVideoMetadata,
@@ -29,147 +32,133 @@ import {
   getValidDriveAccessToken,
 } from "./google-drive-token.service";
 import { getSupabaseDriveRecord } from "./google-supabase-token.service";
-import { validateVideoFile } from "./video-file-validation";
+import { createResumableSession, getFileMetadata } from "./google-drive-client";
+import { supportedExtensions } from "./video-file-validation";
 import { buildPlaybackUrl } from "./playback-token.service";
 
-const CHUNK_SIZE = 5 * 1024 * 1024;
-const SESSION_TTL_MS = 60 * 60 * 1000;
-const uploadChunks = new Map<string, Map<number, Buffer>>();
+// Uploads grandes podem levar mais de uma hora em conexões lentas.
+const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
+/** Tamanho de chunk usado pelo navegador (8 MiB). */
+const RESUMABLE_CHUNK_SIZE = 8 * 1024 * 1024;
+// Um vídeo por requisição mantém o download+upload dentro do tempo/memória da
+// Function. O cliente/script repete até o job concluir.
+const MIGRATION_BATCH_SIZE = 1;
 
-export function resetUploadSessions(): void {
-  uploadChunks.clear();
-  mutate((db) => {
-    db.video_upload_sessions = [];
-  });
+function nowIso(): string {
+  return new Date().toISOString();
 }
 
-function activeEnrollmentIds(studentId: string): string[] {
-  return getDb()
-    .enrollments.filter(
-      (enrollment) =>
-        enrollment.student_profile_id === studentId &&
-        enrollment.status === "active",
-    )
-    .map((enrollment) => enrollment.id);
+type Role = "teacher" | "student";
+
+function ownerOf(video: Video): string | null {
+  return video.owner_id ?? video.teacher_id ?? null;
 }
 
-function hasTechniqueAccess(studentId: string, techniqueId: string | null): boolean {
-  if (!techniqueId) return false;
-  const enrollments = activeEnrollmentIds(studentId);
-  return getDb().student_technique_access.some(
-    (access) =>
-      enrollments.includes(access.enrollment_id) &&
-      access.technique_id === techniqueId &&
-      !access.revoked_at,
-  );
+async function auditClient() {
+  return isAdminClientAvailable() ? createAdminClient() : await createClient();
 }
 
-function hasLessonVideoAccess(studentId: string, videoId: string): boolean {
-  const db = getDb();
-  const enrollmentIds = new Set(activeEnrollmentIds(studentId));
-  const lessonIds = db.lessons
-    .filter(
-      (lesson) =>
-        enrollmentIds.has(lesson.enrollment_id) &&
-        (lesson.status === "scheduled" || lesson.status === "completed"),
-    )
-    .map((lesson) => lesson.id);
-  return db.lesson_videos.some(
-    (association) =>
-      association.video_id === videoId && lessonIds.includes(association.lesson_id),
-  );
+async function hasDriveToken(userId: string): Promise<boolean> {
+  if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+    return Boolean(await getSupabaseDriveRecord(userId));
+  }
+  return Boolean(getDriveTokenRecord(userId));
 }
 
-function hasPlanVideoAccess(studentId: string, videoId: string): boolean {
-  const db = getDb();
-  const enrollmentIds = activeEnrollmentIds(studentId);
-  const planIds = db.plan_enrollments
-    .filter((association) => enrollmentIds.includes(association.enrollment_id))
-    .map((association) => association.monthly_plan_id)
-    .filter((planId) =>
-      db.monthly_plans.some(
-        (plan) => plan.id === planId && plan.status === "published",
-      ),
-    );
-  const dayIds = db.plan_days
-    .filter((day) => planIds.includes(day.monthly_plan_id))
-    .map((day) => day.id);
-  return db.plan_day_videos.some(
-    (association) =>
-      association.video_id === videoId && dayIds.includes(association.plan_day_id),
-  );
+/**
+ * Busca um vídeo respeitando o RLS. Se um professor não conseguir ver um vídeo
+ * pessoal de um aluno, tenta via service role e valida o vínculo de instrutor.
+ */
+async function fetchVideoForAccess(
+  videoId: string,
+  userId: string,
+  role: Role,
+): Promise<Video | null> {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("videos")
+    .select("*")
+    .eq("id", videoId)
+    .maybeSingle();
+  if (error) throw mapPostgrestError(error);
+  if (data) return data as Video;
+
+  if (role !== "teacher" || !isAdminClientAvailable()) return null;
+
+  const admin = createAdminClient();
+  const { data: adminVideo, error: adminError } = await admin
+    .from("videos")
+    .select("*")
+    .eq("id", videoId)
+    .maybeSingle();
+  if (adminError) throw mapPostgrestError(adminError);
+  if (!adminVideo || adminVideo.owner_role !== "student" || !adminVideo.owner_id) {
+    return null;
+  }
+
+  const { data: enrollment, error: enrollmentError } = await supabase
+    .from("enrollments")
+    .select("id")
+    .eq("teacher_id", userId)
+    .eq("student_profile_id", adminVideo.owner_id)
+    .eq("status", "active")
+    .limit(1)
+    .maybeSingle();
+  if (enrollmentError) throw mapPostgrestError(enrollmentError);
+
+  return enrollment ? (adminVideo as Video) : null;
 }
 
-function isInstructorOf(teacherId: string, studentId: string): boolean {
-  return getDb().enrollments.some(
-    (enrollment) =>
-      enrollment.teacher_id === teacherId &&
-      enrollment.student_profile_id === studentId &&
-      enrollment.status === "active",
-  );
+async function findVideo(videoId: string): Promise<Video> {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("videos")
+    .select("*")
+    .eq("id", videoId)
+    .maybeSingle();
+  if (error) throw mapPostgrestError(error);
+  if (!data) throw ApiError.notFound("Vídeo não encontrado");
+  return data as Video;
+}
+
+function assertCanModify(video: Video, userId: string): void {
+  const owner = ownerOf(video);
+  if (!owner || owner !== userId) {
+    throw ApiError.forbidden("Acesso negado");
+  }
+}
+
+async function authorizeVideo(
+  videoId: string,
+  userId: string,
+  role: Role,
+  options: { modify?: boolean } = {},
+): Promise<Video> {
+  const video = await fetchVideoForAccess(videoId, userId, role);
+  if (!video) throw ApiError.notFound("Vídeo não encontrado");
+  if (video.deleted_at) {
+    throw new ApiError(410, "GONE", "Vídeo removido");
+  }
+  if (options.modify) assertCanModify(video, userId);
+  return video;
 }
 
 export function canAccessVideo(
   video: Video,
   userId: string,
-  role: "teacher" | "student",
+  role: Role,
 ): boolean {
   if (video.owner_id === userId || video.teacher_id === userId) return true;
   if (video.deleted_at || video.status === "archived") return false;
-
-  if (video.visibility === "personal") {
-    if (role === "teacher" && video.owner_id) {
-      return isInstructorOf(userId, video.owner_id);
-    }
-    return video.owner_id === userId;
-  }
-
-  if (role === "student") {
-    return (
-      hasTechniqueAccess(userId, video.technique_id) ||
-      hasLessonVideoAccess(userId, video.id) ||
-      hasPlanVideoAccess(userId, video.id)
-    );
-  }
-
-  return false;
-}
-
-function findVideo(videoId: string): Video {
-  const video = getDb().videos.find((item) => item.id === videoId);
-  if (!video) throw ApiError.notFound("Vídeo não encontrado");
-  return video;
-}
-
-function authorizeVideo(
-  videoId: string,
-  userId: string,
-  role: "teacher" | "student",
-  options: { modify?: boolean } = {},
-): Video {
-  const video = findVideo(videoId);
-  if (video.deleted_at) {
-    throw new ApiError(410, "GONE", "Vídeo removido");
-  }
-
-  if (options.modify) {
-    const owner = video.owner_id ?? video.teacher_id;
-    if (owner !== userId && role !== "teacher") {
-      throw ApiError.forbidden("Acesso negado");
-    }
-    if (role === "teacher" && video.teacher_id !== userId && video.owner_id !== userId) {
-      throw ApiError.forbidden("Acesso negado");
-    }
-  } else if (!canAccessVideo(video, userId, role)) {
-    throw ApiError.forbidden("Você não tem permissão para acessar este vídeo");
-  }
-
-  return video;
+  if (video.visibility === "personal") return false;
+  // Para vídeos da biblioteca o RLS já autoriza o aluno; esta função é apenas
+  // um atalho síncrono usado por componentes/testes.
+  return role === "student";
 }
 
 export interface CreateDriveVideoInput {
   ownerId: string;
-  ownerRole: "teacher" | "student";
+  ownerRole: Role;
   visibility: "library" | "personal";
   moduleId?: string | null;
   title: string;
@@ -182,19 +171,25 @@ export interface CreateDriveVideoInput {
   mimeType?: string;
 }
 
-/** Cria o registro de vídeo com provider=google_drive (Propriedade 4). */
-export function createDriveVideoRecord(input: CreateDriveVideoInput): Video {
-  let teacherId = input.ownerId;
-  let moduleId = input.moduleId ?? "";
-  let techniqueId = "";
+/** Cria o registro de vídeo com provider=google_drive. */
+export async function createDriveVideoRecord(
+  input: CreateDriveVideoInput,
+): Promise<Video> {
+  const supabase = await createClient();
+  let teacherId: string | null = null;
+  let moduleId: string | null = null;
+  let techniqueId: string | null = null;
 
   if (input.visibility === "library") {
     if (!input.moduleId) {
       throw ApiError.validation("Informe o módulo para vídeos da biblioteca");
     }
-    const moduleRecord = getDb().modules.find(
-      (item) => item.id === input.moduleId,
-    );
+    const { data: moduleRecord, error } = await supabase
+      .from("modules")
+      .select("id, teacher_id, technique_id")
+      .eq("id", input.moduleId)
+      .maybeSingle();
+    if (error) throw mapPostgrestError(error);
     if (!moduleRecord) throw ApiError.notFound("Módulo não encontrado");
     if (moduleRecord.teacher_id !== input.ownerId) {
       throw ApiError.forbidden("Acesso negado");
@@ -204,37 +199,53 @@ export function createDriveVideoRecord(input: CreateDriveVideoInput): Video {
     techniqueId = moduleRecord.technique_id;
   }
 
-  const timestamp = nowIso();
-  const video: Video = {
-    id: randomUUID(),
-    teacher_id: teacherId,
-    module_id: moduleId,
-    technique_id: techniqueId,
-    title: input.title,
-    description: input.description ?? null,
-    provider: "google_drive",
-    provider_video_id: input.driveFileId,
-    thumbnail_url: input.thumbnailUrl ?? null,
-    playback_url: null,
-    duration_seconds: input.durationSeconds,
-    status: "ready",
-    created_at: timestamp,
-    updated_at: timestamp,
-    owner_id: input.ownerId,
-    owner_role: input.ownerRole,
-    visibility: input.visibility,
-    size_bytes: input.sizeBytes,
-    drive_file_url: `https://drive.google.com/file/d/${input.driveFileId}/view`,
-    metadata_synced_at: timestamp,
-    archived_at: null,
-    deleted_at: null,
-    mux_id: null,
-  };
+  // Idempotência: se o complete for repetido com o mesmo arquivo, reaproveita
+  // o registro já criado em vez de duplicar o vídeo.
+  const { data: existing, error: existingError } = await supabase
+    .from("videos")
+    .select("*")
+    .eq("provider", "google_drive")
+    .eq("provider_video_id", input.driveFileId)
+    .eq("owner_id", input.ownerId)
+    .is("deleted_at", null)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (existingError) throw mapPostgrestError(existingError);
+  if (existing) return existing as Video;
 
-  mutate((db) => {
-    db.videos.push(video);
-  });
-  recordVideoAccess(video.id, input.ownerId, {
+  const timestamp = nowIso();
+  const { data, error } = await supabase
+    .from("videos")
+    .insert({
+      teacher_id: teacherId,
+      module_id: moduleId,
+      technique_id: techniqueId,
+      title: input.title,
+      description: input.description ?? null,
+      provider: "google_drive",
+      provider_video_id: input.driveFileId,
+      thumbnail_url: input.thumbnailUrl ?? null,
+      playback_url: null,
+      duration_seconds: input.durationSeconds,
+      status: "ready",
+      owner_id: input.ownerId,
+      owner_role: input.ownerRole,
+      visibility: input.visibility,
+      size_bytes: input.sizeBytes,
+      drive_file_url: `https://drive.google.com/file/d/${input.driveFileId}/view`,
+      metadata_synced_at: timestamp,
+      archived_at: null,
+      deleted_at: null,
+      mux_id: null,
+      updated_at: timestamp,
+    })
+    .select("*")
+    .single();
+  if (error) throw mapPostgrestError(error);
+
+  const video = data as Video;
+  await recordVideoAccess(video.id, input.ownerId, {
     action: "upload",
     success: true,
     metadata: {
@@ -251,7 +262,13 @@ export async function uploadLibraryVideo(
   file: File,
   input: { title: string; description?: string | null; moduleId: string },
 ): Promise<Video> {
-  const moduleRecord = getDb().modules.find((item) => item.id === input.moduleId);
+  const supabase = await createClient();
+  const { data: moduleRecord, error } = await supabase
+    .from("modules")
+    .select("id, teacher_id, technique_id, status")
+    .eq("id", input.moduleId)
+    .maybeSingle();
+  if (error) throw mapPostgrestError(error);
   if (!moduleRecord) throw ApiError.notFound("Módulo não encontrado");
   if (moduleRecord.teacher_id !== teacherId) throw ApiError.forbidden("Acesso negado");
   if (moduleRecord.status === "archived") {
@@ -306,14 +323,14 @@ export async function uploadPersonalVideo(
 export async function getUserVideo(
   videoId: string,
   userId: string,
-  role: "teacher" | "student",
+  role: Role,
 ): Promise<Video> {
-  return { ...authorizeVideo(videoId, userId, role) };
+  return { ...(await authorizeVideo(videoId, userId, role)) };
 }
 
 export async function listUserVideos(
   userId: string,
-  role: "teacher" | "student",
+  role: Role,
   filters: {
     technique_id?: string;
     module_id?: string;
@@ -325,68 +342,65 @@ export async function listUserVideos(
     offset?: number;
   } = {},
 ): Promise<{ videos: Video[]; pagination: ReturnType<typeof buildPagination> }> {
-  const db = getDb();
-  let videos = db.videos.filter((video) => !video.deleted_at);
+  void role;
+  const supabase = await createClient();
+  let query = supabase
+    .from("videos")
+    .select("*", { count: "exact" })
+    .is("deleted_at", null);
 
   if (filters.visibility) {
-    videos = videos.filter(
-      (video) => (video.visibility ?? "library") === filters.visibility,
-    );
+    query = query.eq("visibility", filters.visibility);
   }
   if (filters.technique_id) {
-    videos = videos.filter((video) => video.technique_id === filters.technique_id);
+    query = query.eq("technique_id", filters.technique_id);
   }
   if (filters.module_id) {
-    videos = videos.filter((video) => video.module_id === filters.module_id);
+    query = query.eq("module_id", filters.module_id);
   }
   if (filters.archived === true) {
-    videos = videos.filter(
-      (video) => video.status === "archived" || Boolean(video.archived_at),
-    );
+    query = query.or("status.eq.archived,archived_at.not.is.null");
   } else {
-    videos = videos.filter(
-      (video) => video.status !== "archived" && !video.archived_at,
-    );
+    query = query.neq("status", "archived").is("archived_at", null);
   }
 
-  if (role === "teacher") {
-    videos = videos.filter(
-      (video) =>
-        video.teacher_id === userId || video.owner_id === userId,
-    );
-  } else {
-    videos = videos.filter((video) => canAccessVideo(video, userId, role));
-  }
-
-  videos = videos.sort((a, b) => b.created_at.localeCompare(a.created_at));
   const page = filters.page ?? 1;
   const pageSize = filters.pageSize ?? filters.limit ?? 20;
-  const offset = filters.offset;
-  const selected =
-    offset !== undefined
-      ? videos.slice(offset, offset + pageSize)
-      : paginate(videos, page, pageSize);
+  const from =
+    filters.offset !== undefined ? filters.offset : (page - 1) * pageSize;
+
+  const { data, error, count } = await query
+    .order("created_at", { ascending: false })
+    .range(from, from + pageSize - 1);
+
+  if (error) throw mapPostgrestError(error);
 
   return {
-    videos: selected,
-    pagination: buildPagination(videos.length, page, pageSize),
+    videos: (data ?? []) as Video[],
+    pagination: buildPagination(count ?? 0, page, pageSize),
   };
 }
 
 export async function getVideoPlayback(
   videoId: string,
   userId: string,
-  role: "teacher" | "student",
+  role: Role,
   context: { ip?: string | null; userAgent?: string | null } = {},
 ): Promise<PlaybackUrlResult & { video: Video }> {
-  const video = authorizeVideo(videoId, userId, role);
+  const video = await authorizeVideo(videoId, userId, role);
 
   if (video.provider === "google_drive") {
-    const ownerUserId = video.owner_id ?? video.teacher_id;
-    const ownerToken = process.env.NEXT_PUBLIC_SUPABASE_URL
-      ? await getSupabaseDriveRecord(ownerUserId)
-      : getDriveTokenRecord(ownerUserId);
-    if (!ownerToken) {
+    const ownerUserId = ownerOf(video);
+    if (!ownerUserId) {
+      throw new ApiError(
+        409,
+        "CONFLICT",
+        "O vídeo não possui um proprietário válido no Drive.",
+        { drive_error: "token_expired", requires_reauth: true },
+      );
+    }
+
+    if (!(await hasDriveToken(ownerUserId))) {
       throw new ApiError(
         409,
         "CONFLICT",
@@ -407,7 +421,7 @@ export async function getVideoPlayback(
       ownerUserId,
       driveFileId: video.provider_video_id,
     });
-    recordVideoAccess(video.id, userId, {
+    await recordVideoAccess(video.id, userId, {
       action: "playback",
       success: true,
       ip: context.ip,
@@ -435,20 +449,18 @@ export async function getVideoPlayback(
     driveFileId: video.provider_video_id,
     expiresIn: video.provider === "mux" ? 86_400 : 3_600,
   });
-  // O endpoint de embed resolve providers não-Drive usando este fallback.
-  const playback_url = video.provider === "mux" ? legacyUrl : legacyUrl;
 
-  recordVideoAccess(video.id, userId, {
+  await recordVideoAccess(video.id, userId, {
     action: "playback",
     success: true,
     ip: context.ip,
     userAgent: context.userAgent,
     metadata: { provider: video.provider },
   });
-  return { ...result, playback_url, video };
+  return { ...result, playback_url: legacyUrl, video };
 }
 
-export function recordVideoAccess(
+export async function recordVideoAccess(
   videoId: string,
   userId: string,
   input: {
@@ -458,7 +470,7 @@ export function recordVideoAccess(
     userAgent?: string | null;
     metadata?: Record<string, unknown>;
   },
-): VideoAccessAuditRecord {
+): Promise<VideoAccessAuditRecord> {
   const record: VideoAccessAuditRecord = {
     id: randomUUID(),
     video_id: videoId,
@@ -470,15 +482,24 @@ export function recordVideoAccess(
     success: input.success !== false,
     metadata: input.metadata ?? {},
   };
-  mutate((db) => {
-    db.video_access_audit.push(record);
-  });
+
+  try {
+    const client = await auditClient();
+    const { error } = await client.from("video_access_audit").insert({ ...record });
+    if (error) throw error;
+  } catch (error) {
+    console.warn("[video-audit] falha ao persistir acesso", {
+      video_id: videoId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+
   return record;
 }
 
-export function listVideoAccessAudit(
+export async function listVideoAccessAudit(
   requesterId: string,
-  role: "teacher" | "student",
+  role: Role,
   filters: {
     videoId?: string;
     userId?: string;
@@ -487,56 +508,45 @@ export function listVideoAccessAudit(
     page?: number;
     pageSize?: number;
   } = {},
-): { logs: VideoAccessAuditRecord[]; pagination: ReturnType<typeof buildPagination> } {
-  const db = getDb();
-  let logs = db.video_access_audit;
+): Promise<{
+  logs: VideoAccessAuditRecord[];
+  pagination: ReturnType<typeof buildPagination>;
+}> {
+  void requesterId;
+  void role;
+  const supabase = await createClient();
+  let query = supabase
+    .from("video_access_audit")
+    .select("*", { count: "exact" })
+    .order("accessed_at", { ascending: false });
 
-  if (role === "student") {
-    logs = logs.filter((log) => log.user_id === requesterId);
-  } else {
-    const ownVideoIds = new Set(
-      db.videos
-        .filter(
-          (video) =>
-            video.teacher_id === requesterId || video.owner_id === requesterId,
-        )
-        .map((video) => video.id),
-    );
-    logs = logs.filter(
-      (log) => ownVideoIds.has(log.video_id) || log.user_id === requesterId,
-    );
-  }
+  if (filters.videoId) query = query.eq("video_id", filters.videoId);
+  if (filters.userId) query = query.eq("user_id", filters.userId);
+  if (filters.dateFrom) query = query.gte("accessed_at", filters.dateFrom);
+  if (filters.dateTo) query = query.lte("accessed_at", filters.dateTo);
 
-  if (filters.videoId) logs = logs.filter((log) => log.video_id === filters.videoId);
-  if (filters.userId) logs = logs.filter((log) => log.user_id === filters.userId);
-  if (filters.dateFrom) {
-    logs = logs.filter((log) => log.accessed_at >= filters.dateFrom!);
-  }
-  if (filters.dateTo) {
-    logs = logs.filter((log) => log.accessed_at <= filters.dateTo!);
-  }
-
-  const sorted = [...logs].sort((a, b) =>
-    b.accessed_at.localeCompare(a.accessed_at),
-  );
   const page = filters.page ?? 1;
   const pageSize = filters.pageSize ?? 20;
+  const from = (page - 1) * pageSize;
+  const { data, error, count } = await query.range(from, from + pageSize - 1);
+  if (error) throw mapPostgrestError(error);
+
   return {
-    logs: paginate(sorted, page, pageSize),
-    pagination: buildPagination(sorted.length, page, pageSize),
+    logs: (data ?? []) as VideoAccessAuditRecord[],
+    pagination: buildPagination(count ?? 0, page, pageSize),
   };
 }
 
 export async function updateVideoForUser(
   videoId: string,
   userId: string,
-  role: "teacher" | "student",
+  role: Role,
   data: { title?: string; description?: string | null },
 ): Promise<Video> {
-  const video = authorizeVideo(videoId, userId, role, { modify: true });
-  const ownerUserId = video.owner_id ?? video.teacher_id;
+  const video = await authorizeVideo(videoId, userId, role, { modify: true });
+  const ownerUserId = ownerOf(video);
 
-  if (video.provider === "google_drive") {
+  if (video.provider === "google_drive" && ownerUserId) {
     try {
       await updateDriveFileMetadata(ownerUserId, video.provider_video_id, {
         name: data.title ?? video.title,
@@ -550,28 +560,35 @@ export async function updateVideoForUser(
     }
   }
 
-  return mutate((db) => {
-    const record = db.videos.find((item) => item.id === videoId);
-    if (!record) throw ApiError.notFound("Vídeo não encontrado");
-    if (data.title !== undefined) record.title = data.title;
-    if (data.description !== undefined) record.description = data.description;
-    record.metadata_synced_at = nowIso();
-    record.updated_at = nowIso();
-    return { ...record };
-  });
+  const supabase = await createClient();
+  const { data: updated, error } = await supabase
+    .from("videos")
+    .update({
+      ...(data.title !== undefined ? { title: data.title } : {}),
+      ...(data.description !== undefined
+        ? { description: data.description }
+        : {}),
+      metadata_synced_at: nowIso(),
+      updated_at: nowIso(),
+    })
+    .eq("id", videoId)
+    .select("*")
+    .single();
+  if (error) throw mapPostgrestError(error);
+  return updated as Video;
 }
 
 export async function deleteVideoForUser(
   videoId: string,
   userId: string,
-  role: "teacher" | "student",
+  role: Role,
   options: { hard?: boolean } = {},
 ): Promise<{ success: boolean; hard: boolean; driveDeleted: boolean }> {
-  const video = authorizeVideo(videoId, userId, role, { modify: true });
-  const ownerUserId = video.owner_id ?? video.teacher_id;
+  const video = await authorizeVideo(videoId, userId, role, { modify: true });
+  const ownerUserId = ownerOf(video);
   let driveDeleted = false;
 
-  if (options.hard && video.provider === "google_drive") {
+  if (options.hard && video.provider === "google_drive" && ownerUserId) {
     try {
       await deleteVideoFile(ownerUserId, video.provider_video_id);
       driveDeleted = true;
@@ -583,15 +600,20 @@ export async function deleteVideoForUser(
     }
   }
 
-  mutate((db) => {
-    const record = db.videos.find((item) => item.id === videoId);
-    if (!record) return;
-    record.deleted_at = nowIso();
-    record.status = "archived";
-    record.archived_at = record.archived_at ?? nowIso();
-    record.updated_at = nowIso();
-  });
-  recordVideoAccess(video.id, userId, {
+  const timestamp = nowIso();
+  const supabase = await createClient();
+  const { error } = await supabase
+    .from("videos")
+    .update({
+      deleted_at: timestamp,
+      status: "archived",
+      archived_at: video.archived_at ?? timestamp,
+      updated_at: timestamp,
+    })
+    .eq("id", videoId);
+  if (error) throw mapPostgrestError(error);
+
+  await recordVideoAccess(video.id, userId, {
     action: "delete",
     success: true,
     metadata: { hard: options.hard === true, drive_deleted: driveDeleted },
@@ -603,9 +625,9 @@ export async function archiveDriveVideoAssets(
   userId: string,
   videoId: string,
 ): Promise<void> {
-  const video = findVideo(videoId);
-  const ownerUserId = video.owner_id ?? video.teacher_id;
-  if (video.provider !== "google_drive") return;
+  const video = await findVideo(videoId);
+  const ownerUserId = ownerOf(video);
+  if (video.provider !== "google_drive" || !ownerUserId) return;
 
   try {
     const folderId = await getArchiveFolderId(ownerUserId);
@@ -617,24 +639,34 @@ export async function archiveDriveVideoAssets(
     });
   }
 
-  mutate((db) => {
-    const record = db.videos.find((item) => item.id === videoId);
-    if (record) {
-      record.archived_at = record.archived_at ?? nowIso();
-      record.status = "archived";
-      record.updated_at = nowIso();
-    }
-  });
+  const supabase = await createClient();
+  const timestamp = nowIso();
+  const { error } = await supabase
+    .from("videos")
+    .update({
+      archived_at: video.archived_at ?? timestamp,
+      status: "archived",
+      updated_at: timestamp,
+    })
+    .eq("id", videoId);
+  if (error) throw mapPostgrestError(error);
+  void userId;
 }
 
 export async function archiveDriveModuleAssets(
   userId: string,
   moduleId: string,
 ): Promise<void> {
-  const videos = getDb().videos.filter(
-    (video) => video.module_id === moduleId && video.provider === "google_drive",
-  );
-  for (const video of videos) {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("videos")
+    .select("id")
+    .eq("module_id", moduleId)
+    .eq("provider", "google_drive")
+    .is("deleted_at", null);
+  if (error) throw mapPostgrestError(error);
+
+  for (const video of data ?? []) {
     await archiveDriveVideoAssets(userId, video.id);
   }
 }
@@ -643,11 +675,16 @@ export async function archiveDriveTechniqueAssets(
   userId: string,
   techniqueId: string,
 ): Promise<void> {
-  const videos = getDb().videos.filter(
-    (video) =>
-      video.technique_id === techniqueId && video.provider === "google_drive",
-  );
-  for (const video of videos) {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("videos")
+    .select("id")
+    .eq("technique_id", techniqueId)
+    .eq("provider", "google_drive")
+    .is("deleted_at", null);
+  if (error) throw mapPostgrestError(error);
+
+  for (const video of data ?? []) {
     await archiveDriveVideoAssets(userId, video.id);
   }
 }
@@ -655,25 +692,39 @@ export async function archiveDriveTechniqueAssets(
 export async function moveVideoForUser(
   videoId: string,
   userId: string,
-  role: "teacher" | "student",
+  role: Role,
   destination: { destination_module_id?: string; archive?: boolean },
 ): Promise<{ video: Video; folder_id: string | null }> {
-  const video = authorizeVideo(videoId, userId, role, { modify: true });
-  const ownerUserId = video.owner_id ?? video.teacher_id;
+  const video = await authorizeVideo(videoId, userId, role, { modify: true });
+  const ownerUserId = ownerOf(video);
 
-  if (video.provider !== "google_drive") {
+  if (video.provider !== "google_drive" || !ownerUserId) {
     throw ApiError.conflict("Apenas vídeos do Google Drive podem ser movidos");
   }
 
   let destinationFolderId: string;
+  let destinationModule: {
+    id: string;
+    technique_id: string;
+  } | null = null;
+
   if (destination.archive) {
     destinationFolderId = await getArchiveFolderId(ownerUserId);
   } else if (destination.destination_module_id) {
-    const moduleRecord = getDb().modules.find(
-      (item) => item.id === destination.destination_module_id,
-    );
+    const supabase = await createClient();
+    const { data: moduleRecord, error } = await supabase
+      .from("modules")
+      .select("id, teacher_id, technique_id, name")
+      .eq("id", destination.destination_module_id)
+      .maybeSingle();
+    if (error) throw mapPostgrestError(error);
     if (!moduleRecord) throw ApiError.notFound("Módulo de destino não encontrado");
     if (moduleRecord.teacher_id !== userId) throw ApiError.forbidden("Acesso negado");
+
+    destinationModule = {
+      id: moduleRecord.id,
+      technique_id: moduleRecord.technique_id,
+    };
     destinationFolderId = await createModuleFolderIfNeeded(
       userId,
       moduleRecord.technique_id,
@@ -684,43 +735,49 @@ export async function moveVideoForUser(
     throw ApiError.validation("Informe o módulo de destino ou archive=true");
   }
 
-  await moveDriveVideo(ownerUserId, video.provider_video_id, destinationFolderId);
+  await moveDriveVideo(
+    ownerUserId,
+    video.provider_video_id,
+    destinationFolderId,
+  );
 
-  const updated = mutate((db) => {
-    const record = db.videos.find((item) => item.id === videoId);
-    if (!record) throw ApiError.notFound("Vídeo não encontrado");
-    if (destination.archive) {
-      record.status = "archived";
-      record.archived_at = nowIso();
-    } else if (destination.destination_module_id) {
-      const moduleRecord = db.modules.find(
-        (item) => item.id === destination.destination_module_id,
-      );
-      record.module_id = destination.destination_module_id;
-      record.technique_id = moduleRecord?.technique_id ?? record.technique_id;
-      if (record.status === "archived") record.status = "ready";
-      record.archived_at = null;
-    }
-    record.updated_at = nowIso();
-    return { ...record };
-  });
+  const timestamp = nowIso();
+  const supabase = await createClient();
+  const { data: updated, error } = await supabase
+    .from("videos")
+    .update({
+      ...(destination.archive
+        ? { status: "archived", archived_at: timestamp }
+        : {
+            module_id: destinationModule?.id ?? video.module_id,
+            technique_id: destinationModule?.technique_id ?? video.technique_id,
+            status: "ready",
+            archived_at: null,
+          }),
+      updated_at: timestamp,
+    })
+    .eq("id", videoId)
+    .select("*")
+    .single();
+  if (error) throw mapPostgrestError(error);
 
-  return { video: updated, folder_id: destinationFolderId };
+  return { video: updated as Video, folder_id: destinationFolderId };
 }
 
 export async function shareVideoForUser(
   videoId: string,
   userId: string,
-  role: "teacher" | "student",
+  role: Role,
   email: string,
 ): Promise<void> {
-  const video = authorizeVideo(videoId, userId, role, { modify: true });
-  if (video.provider !== "google_drive") {
+  const video = await authorizeVideo(videoId, userId, role, { modify: true });
+  const ownerUserId = ownerOf(video);
+  if (video.provider !== "google_drive" || !ownerUserId) {
     throw ApiError.conflict("Compartilhamento disponível apenas para vídeos do Google Drive");
   }
-  const ownerUserId = video.owner_id ?? video.teacher_id;
+
   await shareVideoWithUser(ownerUserId, video.provider_video_id, email);
-  recordVideoAccess(video.id, userId, {
+  await recordVideoAccess(video.id, userId, {
     action: "share",
     success: true,
     metadata: { shared_with: email },
@@ -730,358 +787,477 @@ export async function shareVideoForUser(
 export async function refreshVideoMetadata(
   videoId: string,
   userId: string,
-  role: "teacher" | "student",
+  role: Role,
 ): Promise<Video> {
-  const video = authorizeVideo(videoId, userId, role);
-  if (video.provider !== "google_drive") return { ...video };
+  const video = await authorizeVideo(videoId, userId, role);
+  const ownerUserId = ownerOf(video);
+  if (video.provider !== "google_drive" || !ownerUserId) return { ...video };
 
   const metadata = await getDriveVideoMetadata(
-    video.owner_id ?? video.teacher_id,
+    ownerUserId,
     video.provider_video_id,
   );
-  return mutate((db) => {
-    const record = db.videos.find((item) => item.id === videoId);
-    if (!record) throw ApiError.notFound("Vídeo não encontrado");
-    if (metadata.videoMediaMetadata?.durationMillis) {
-      record.duration_seconds = Math.round(
-        metadata.videoMediaMetadata.durationMillis / 1000,
-      );
-    }
-    if (metadata.size) record.size_bytes = Number(metadata.size);
-    if (metadata.thumbnailLink) record.thumbnail_url = metadata.thumbnailLink;
-    record.metadata_synced_at = nowIso();
-    record.updated_at = nowIso();
-    return { ...record };
-  });
+
+  const supabase = await createClient();
+  const { data: updated, error } = await supabase
+    .from("videos")
+    .update({
+      ...(metadata.videoMediaMetadata?.durationMillis
+        ? {
+            duration_seconds: Math.round(
+              metadata.videoMediaMetadata.durationMillis / 1000,
+            ),
+          }
+        : {}),
+      ...(metadata.size ? { size_bytes: Number(metadata.size) } : {}),
+      ...(metadata.thumbnailLink
+        ? { thumbnail_url: metadata.thumbnailLink }
+        : {}),
+      metadata_synced_at: nowIso(),
+      updated_at: nowIso(),
+    })
+    .eq("id", videoId)
+    .select("*")
+    .single();
+  if (error) throw mapPostgrestError(error);
+  return updated as Video;
 }
 
 /* -------------------------------------------------------------------------- */
-/* Upload em chunks                                                            */
+/* Upload resumable direto no Drive                                            */
 /* -------------------------------------------------------------------------- */
 
-export function initializeUploadSession(
+export interface InitializeUploadInput {
+  title: string;
+  description?: string | null;
+  destination: "library" | "personal";
+  fileName: string;
+  mimeType: string;
+  totalBytes: number;
+  techniqueId?: string | null;
+  moduleId?: string | null;
+}
+
+export interface InitializeUploadResult {
+  session: VideoUploadSession;
+  uploadUrl: string;
+}
+
+export async function initializeUploadSession(
   userId: string,
-  input: {
-    title: string;
-    description?: string | null;
-    destination: "library" | "personal";
-    fileName: string;
-    mimeType: string;
-    totalBytes: number;
-    techniqueId?: string | null;
-    moduleId?: string | null;
-    chunkSize?: number;
-  },
-): VideoUploadSession {
-  if (input.totalBytes <= 0) {
+  input: InitializeUploadInput,
+): Promise<InitializeUploadResult> {
+  if (!Number.isFinite(input.totalBytes) || input.totalBytes <= 0) {
     throw new ApiError(400, "VALIDATION_ERROR", "Arquivo vazio");
   }
-  const maxBytes = Number(process.env.GOOGLE_DRIVE_MAX_FILE_BYTES) || 5 * 1024 * 1024 * 1024;
+  if (input.title.trim().length < 2 || input.title.trim().length > 200) {
+    throw ApiError.validation(
+      "O título deve ter entre 2 e 200 caracteres",
+    );
+  }
+  if ((input.description ?? "").length > 2000) {
+    throw ApiError.validation(
+      "A descrição deve ter no máximo 2000 caracteres",
+    );
+  }
+
+  const extension = input.fileName.split(".").pop()?.toLowerCase() ?? "";
+  if (!supportedExtensions().includes(extension)) {
+    throw new ApiError(
+      415,
+      "UNSUPPORTED_MEDIA_TYPE",
+      "Formato de arquivo não suportado",
+      { drive_error: "invalid_file" },
+    );
+  }
+  const maxBytes =
+    Number(process.env.GOOGLE_DRIVE_MAX_FILE_BYTES) || 5 * 1024 * 1024 * 1024;
   if (input.totalBytes > maxBytes) {
     throw new ApiError(413, "FILE_TOO_LARGE", "O arquivo excede o limite de 5GB", {
       drive_error: "file_too_large",
     });
   }
 
-  const chunkSize = input.chunkSize ?? CHUNK_SIZE;
-  const totalChunks = Math.max(1, Math.ceil(input.totalBytes / chunkSize));
-  const timestamp = nowIso();
-  const session: VideoUploadSession = {
-    id: randomUUID(),
-    user_id: userId,
-    destination: input.destination,
-    title: input.title,
-    description: input.description ?? null,
-    technique_id: input.techniqueId ?? null,
-    module_id: input.moduleId ?? null,
-    file_name: input.fileName,
-    mime_type: input.mimeType,
-    total_bytes: input.totalBytes,
-    chunk_size: chunkSize,
-    total_chunks: totalChunks,
-    received_chunks: [],
-    drive_session_url: null,
-    status: "initialized",
-    created_at: timestamp,
-    expires_at: new Date(Date.now() + SESSION_TTL_MS).toISOString(),
-  };
+  const supabase = await createClient();
+  let techniqueId = input.techniqueId ?? null;
+  let moduleId = input.moduleId ?? null;
 
-  mutate((db) => {
-    db.video_upload_sessions.push(session);
+  if (input.destination === "library") {
+    if (!moduleId) {
+      throw ApiError.validation("Selecione o módulo de destino");
+    }
+    const { data: moduleRecord, error } = await supabase
+      .from("modules")
+      .select("id, teacher_id, technique_id, status")
+      .eq("id", moduleId)
+      .maybeSingle();
+    if (error) throw mapPostgrestError(error);
+    if (!moduleRecord) throw ApiError.notFound("Módulo não encontrado");
+    if (moduleRecord.teacher_id !== userId) throw ApiError.forbidden("Acesso negado");
+    if (moduleRecord.status === "archived") {
+      throw ApiError.conflict("Não é possível adicionar vídeos a um módulo arquivado");
+    }
+    techniqueId = moduleRecord.technique_id;
+    moduleId = moduleRecord.id;
+  } else {
+    techniqueId = null;
+    moduleId = null;
+  }
+
+  const accessToken = await getValidDriveAccessToken(userId);
+  const parentFolderId = await folderForUpload(
+    userId,
+    input.destination,
+    techniqueId,
+    moduleId,
+  );
+  const uploadUrl = await createResumableSession(accessToken, {
+    name: input.fileName,
+    mimeType: input.mimeType,
+    parentId: parentFolderId,
+    size: input.totalBytes,
   });
-  uploadChunks.set(session.id, new Map());
-  return session;
+
+  const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  const chunkSize = Math.min(input.totalBytes, RESUMABLE_CHUNK_SIZE);
+  const totalChunks = Math.max(1, Math.ceil(input.totalBytes / chunkSize));
+  const { data, error } = await supabase
+    .from("video_upload_sessions")
+    .insert({
+      user_id: userId,
+      destination: input.destination,
+      title: input.title,
+      description: input.description ?? null,
+      technique_id: techniqueId,
+      module_id: moduleId,
+      file_name: input.fileName,
+      mime_type: input.mimeType,
+      total_bytes: input.totalBytes,
+      chunk_size: chunkSize,
+      total_chunks: totalChunks,
+      received_chunks: [],
+      drive_session_url: uploadUrl,
+      status: "initialized",
+      expires_at: expiresAt,
+    })
+    .select("*")
+    .single();
+  if (error) throw mapPostgrestError(error);
+
+  return { session: data as VideoUploadSession, uploadUrl };
 }
 
-export function getUploadSession(
+export async function getUploadSession(
   userId: string,
   sessionId: string,
-): VideoUploadSession {
-  const session = getDb().video_upload_sessions.find(
-    (item) => item.id === sessionId,
-  );
-  if (!session) throw ApiError.notFound("Sessão de upload não encontrada");
-  if (session.user_id !== userId) throw ApiError.forbidden("Acesso negado");
+): Promise<VideoUploadSession> {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("video_upload_sessions")
+    .select("*")
+    .eq("id", sessionId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (error) throw mapPostgrestError(error);
+  if (!data) throw ApiError.notFound("Sessão de upload não encontrada");
+
+  const session = data as VideoUploadSession;
+  if (session.status === "completed") return session;
   if (new Date(session.expires_at).getTime() <= Date.now()) {
+    await supabase
+      .from("video_upload_sessions")
+      .update({ status: "expired" })
+      .eq("id", session.id);
     throw new ApiError(410, "GONE", "Sessão de upload expirada");
   }
   return session;
 }
 
-export function appendUploadChunk(
-  userId: string,
-  sessionId: string,
-  chunkIndex: number,
-  data: Uint8Array,
-): {
-  received_chunks: number[];
-  total_chunks: number;
-  bytes_uploaded: number;
-  percentage: number;
-  next_chunk: number | null;
-} {
-  const session = getUploadSession(userId, sessionId);
-  if (session.status === "cancelled" || session.status === "completed") {
-    throw ApiError.conflict("Sessão de upload encerrada");
-  }
-  if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= session.total_chunks) {
-    throw ApiError.validation("Índice de chunk inválido");
-  }
-
-  const chunks = uploadChunks.get(sessionId) ?? new Map<number, Buffer>();
-  chunks.set(chunkIndex, Buffer.from(data));
-  uploadChunks.set(sessionId, chunks);
-
-  const received = [...new Set([...session.received_chunks, chunkIndex])].sort(
-    (a, b) => a - b,
-  );
-  const bytesUploaded = received.reduce(
-    (total, index) => total + (chunks.get(index)?.length ?? 0),
-    0,
-  );
-
-  mutate((db) => {
-    const record = db.video_upload_sessions.find((item) => item.id === sessionId);
-    if (record) {
-      record.received_chunks = received;
-      record.status = "uploading";
-    }
-  });
-
-  const next =
-    received.length >= session.total_chunks
-      ? null
-      : Array.from({ length: session.total_chunks }, (_, index) => index).find(
-          (index) => !received.includes(index),
-        ) ?? null;
-
-  return {
-    received_chunks: received,
-    total_chunks: session.total_chunks,
-    bytes_uploaded: bytesUploaded,
-    percentage: Math.min(
-      100,
-      Math.round((bytesUploaded / session.total_bytes) * 100),
-    ),
-    next_chunk: next,
-  };
+export interface CompleteUploadInput {
+  fileId: string;
+  size?: number;
+  mimeType?: string;
 }
 
 export async function completeUploadSession(
   userId: string,
   sessionId: string,
+  input: CompleteUploadInput,
 ): Promise<{ video: Video; session: VideoUploadSession }> {
-  const session = getUploadSession(userId, sessionId);
-  if (session.received_chunks.length !== session.total_chunks) {
-    throw ApiError.validation("Ainda faltam chunks para concluir o upload");
+  if (!input.fileId) {
+    throw ApiError.validation("file_id do Google Drive é obrigatório");
   }
-  const chunks = uploadChunks.get(sessionId) ?? new Map<number, Buffer>();
-  const buffer = Buffer.concat(
-    Array.from({ length: session.total_chunks }, (_, index) => {
-      const chunk = chunks.get(index);
-      if (!chunk) throw ApiError.validation(`Chunk ${index} ausente`);
-      return chunk;
-    }),
-  );
 
-  const file = new File([buffer], session.file_name, {
-    type: session.mime_type,
-  });
-  const validation = await validateVideoFile(file);
-  if (!validation.valid) {
-    if (validation.code === "file_too_large") {
-      throw new ApiError(413, "FILE_TOO_LARGE", validation.message ?? "Arquivo muito grande");
+  const session = await getUploadSession(userId, sessionId);
+  if (session.status === "cancelled") {
+    throw ApiError.conflict("Sessão de upload encerrada");
+  }
+  if (session.status === "completed") {
+    // Requisição repetida após sucesso (ex.: resposta perdida): devolve o vídeo
+    // já criado em vez de falhar.
+    const supabase = await createClient();
+    const { data: existing } = await supabase
+      .from("videos")
+      .select("*")
+      .eq("provider", "google_drive")
+      .eq("provider_video_id", input.fileId)
+      .eq("owner_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (existing) {
+      return { video: existing as Video, session };
     }
-    throw new ApiError(415, "UNSUPPORTED_MEDIA_TYPE", validation.message ?? "Formato inválido");
+    throw ApiError.conflict("Sessão de upload encerrada");
   }
 
-  const video =
-    session.destination === "personal"
-      ? await uploadPersonalVideo(userId, file, {
-          title: session.title,
-          description: session.description,
-        })
-      : await uploadLibraryVideo(userId, file, {
-          title: session.title,
-          description: session.description,
-          moduleId: session.module_id ?? "",
-        });
+  const accessToken = await getValidDriveAccessToken(userId);
+  const metadata = await getFileMetadata(accessToken, input.fileId);
 
-  const completed = mutate((db) => {
-    const record = db.video_upload_sessions.find((item) => item.id === sessionId);
-    if (record) {
-      record.status = "completed";
-      record.received_chunks = Array.from(
-        { length: record.total_chunks },
+  const video = await createDriveVideoRecord({
+    ownerId: userId,
+    ownerRole: session.destination === "personal" ? "student" : "teacher",
+    visibility: session.destination,
+    moduleId: session.module_id,
+    title: session.title,
+    description: session.description,
+    providerVideoId: input.fileId,
+    driveFileId: input.fileId,
+    sizeBytes:
+      input.size ??
+      (metadata.size ? Number(metadata.size) : session.total_bytes),
+    durationSeconds: metadata.videoMediaMetadata?.durationMillis
+      ? Math.round(metadata.videoMediaMetadata.durationMillis / 1000)
+      : null,
+    thumbnailUrl: metadata.thumbnailLink ?? null,
+    mimeType: metadata.mimeType ?? input.mimeType ?? session.mime_type,
+  });
+
+  const supabase = await createClient();
+  const { data: completed, error } = await supabase
+    .from("video_upload_sessions")
+    .update({
+      status: "completed",
+      received_chunks: Array.from(
+        { length: session.total_chunks },
         (_, index) => index,
-      );
-    }
-    return record ? { ...record } : session;
-  });
-  uploadChunks.delete(sessionId);
-  return { video, session: completed };
+      ),
+    })
+    .eq("id", sessionId)
+    .select("*")
+    .single();
+  if (error) throw mapPostgrestError(error);
+
+  return { video, session: completed as VideoUploadSession };
 }
 
-export function cancelUploadSession(
+export async function cancelUploadSession(
   userId: string,
   sessionId: string,
-): VideoUploadSession {
-  const session = getUploadSession(userId, sessionId);
-  uploadChunks.delete(sessionId);
-  return mutate((db) => {
-    const record = db.video_upload_sessions.find((item) => item.id === sessionId);
-    if (!record) return session;
-    record.status = "cancelled";
-    return { ...record };
-  });
+): Promise<VideoUploadSession> {
+  const session = await getUploadSession(userId, sessionId);
+  if (session.status === "completed") return session;
+
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("video_upload_sessions")
+    .update({ status: "cancelled" })
+    .eq("id", sessionId)
+    .select("*")
+    .single();
+  if (error) throw mapPostgrestError(error);
+  return (data as VideoUploadSession) ?? session;
+}
+
+/** Compatibilidade com testes antigos. */
+export function resetUploadSessions(): void {
+  // As sessões agora vivem no Supabase (RLS por usuário).
 }
 
 /* -------------------------------------------------------------------------- */
-/* Migração Mux → Google Drive                                                 */
+/* Migração Mux → Google Drive (execução sob demanda)                          */
 /* -------------------------------------------------------------------------- */
 
-export function startMigrationJob(
+export async function startMigrationJob(
   userId: string,
   videoIds?: string[],
-  options: { autoStart?: boolean } = {},
-): VideoMigrationJob {
-  const videos = getDb().videos.filter(
-    (video) =>
-      (video.teacher_id === userId || video.owner_id === userId) &&
-      video.provider === "mux" &&
-      (!videoIds?.length || videoIds.includes(video.id)),
-  );
-  const timestamp = nowIso();
-  const job: VideoMigrationJob = {
-    id: randomUUID(),
-    user_id: userId,
-    status: "pending",
-    total_videos: videos.length,
-    processed_videos: 0,
-    failed_videos: 0,
-    errors: [],
-    created_at: timestamp,
-    updated_at: timestamp,
-  };
-  mutate((db) => {
-    db.video_migration_jobs.push(job);
-  });
+): Promise<VideoMigrationJob> {
+  const supabase = await createClient();
+  let countQuery = supabase
+    .from("videos")
+    .select("id", { count: "exact", head: true })
+    .eq("provider", "mux")
+    .is("deleted_at", null);
+  if (videoIds?.length) countQuery = countQuery.in("id", videoIds);
 
-  // Job assíncrono em processo. Em produção, usar fila (Bull/Redis).
-  if (options.autoStart !== false) {
-    queueMicrotask(() => {
-      void runMigrationJob(job.id);
-    });
-  }
-  return job;
+  const { count, error: countError } = await countQuery;
+  if (countError) throw mapPostgrestError(countError);
+
+  const { data, error } = await supabase
+    .from("video_migration_jobs")
+    .insert({
+      user_id: userId,
+      status: "pending",
+      total_videos: count ?? 0,
+      processed_videos: 0,
+      failed_videos: 0,
+      errors: [],
+    })
+    .select("*")
+    .single();
+  if (error) throw mapPostgrestError(error);
+  return data as VideoMigrationJob;
 }
 
-export async function runMigrationJob(jobId: string): Promise<VideoMigrationJob> {
-  const job = getDb().video_migration_jobs.find((item) => item.id === jobId);
-  if (!job) throw ApiError.notFound("Job de migração não encontrado");
+export async function runMigrationJob(
+  userId: string,
+  jobId: string,
+  options: { limit?: number } = {},
+): Promise<VideoMigrationJob> {
+  const supabase = await createClient();
+  const { data: jobData, error: jobError } = await supabase
+    .from("video_migration_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (jobError) throw mapPostgrestError(jobError);
+  if (!jobData) throw ApiError.notFound("Job de migração não encontrado");
 
-  mutate((db) => {
-    const record = db.video_migration_jobs.find((item) => item.id === jobId);
-    if (record) record.status = "running";
-  });
+  let job = jobData as VideoMigrationJob;
+  if (job.status === "completed" || job.status === "cancelled") return job;
 
-  const videos = getDb().videos.filter(
-    (video) =>
-      (video.teacher_id === job.user_id || video.owner_id === job.user_id) &&
-      video.provider === "mux",
+  const running = await supabase
+    .from("video_migration_jobs")
+    .update({ status: "running", updated_at: nowIso() })
+    .eq("id", jobId)
+    .select("*")
+    .single();
+  if (running.error) throw mapPostgrestError(running.error);
+  job = running.data as VideoMigrationJob;
+
+  const limit = Math.max(
+    1,
+    Math.min(options.limit ?? MIGRATION_BATCH_SIZE, 10),
   );
+  let processed = job.processed_videos;
+  let failed = job.failed_videos;
+  const errors = [...job.errors];
 
-  for (const video of videos) {
+  // Não tenta novamente vídeos que já falharam neste job (evita loop infinito).
+  const attemptedIds = Array.from(
+    new Set(
+      errors
+        .map((item) => item.video_id)
+        .filter((id): id is string => Boolean(id)),
+    ),
+  );
+  let videosQuery = supabase
+    .from("videos")
+    .select("*")
+    .eq("provider", "mux")
+    .is("deleted_at", null)
+    .order("created_at", { ascending: true })
+    .limit(limit);
+  if (attemptedIds.length > 0) {
+    videosQuery = videosQuery.not("id", "in", `(${attemptedIds.join(",")})`);
+  }
+
+  const { data: videos, error: videosError } = await videosQuery;
+  if (videosError) throw mapPostgrestError(videosError);
+
+  for (const raw of (videos ?? []) as Video[]) {
     try {
-      if (!getDriveTokenRecord(job.user_id)) {
-        throw new Error("Google Drive não conectado");
+      if (!raw.module_id) {
+        throw new Error("Vídeo sem módulo de destino");
       }
-      const source = video.playback_url ?? DEMO_VIDEO_URL;
+      const source = raw.playback_url ?? DEMO_VIDEO_URL;
       const response = await fetch(source);
-      if (!response.ok) throw new Error(`Falha ao baixar do Mux: ${response.status}`);
+      if (!response.ok) {
+        throw new Error(`Falha ao baixar do Mux: ${response.status}`);
+      }
       const buffer = Buffer.from(await response.arrayBuffer());
-      const file = new File([buffer], `${video.title}.mp4`, { type: "video/mp4" });
-      const uploaded = await uploadVideoFile(job.user_id, file, {
+      const file = new File([buffer], `${raw.title}.mp4`, { type: "video/mp4" });
+      const uploaded = await uploadVideoFile(userId, file, {
         destination: "library",
-        techniqueId: video.technique_id || null,
-        moduleId: video.module_id || null,
+        techniqueId: raw.technique_id,
+        moduleId: raw.module_id,
       });
 
-      mutate((db) => {
-        const record = db.videos.find((item) => item.id === video.id);
-        if (!record) return;
-        record.mux_id = record.provider_video_id;
-        record.provider = "google_drive";
-        record.provider_video_id = uploaded.fileId;
-        record.drive_file_url = `https://drive.google.com/file/d/${uploaded.fileId}/view`;
-        record.size_bytes = uploaded.size;
-        record.duration_seconds =
-          uploaded.durationSeconds ?? record.duration_seconds;
-        record.thumbnail_url = uploaded.thumbnailUrl ?? record.thumbnail_url;
-        record.metadata_synced_at = nowIso();
-        record.status = "ready";
-        record.updated_at = nowIso();
-      });
-      recordVideoAccess(video.id, job.user_id, {
+      const { error: updateError } = await supabase
+        .from("videos")
+        .update({
+          mux_id: raw.provider_video_id,
+          provider: "google_drive",
+          provider_video_id: uploaded.fileId,
+          drive_file_url: `https://drive.google.com/file/d/${uploaded.fileId}/view`,
+          size_bytes: uploaded.size,
+          duration_seconds: uploaded.durationSeconds ?? raw.duration_seconds,
+          thumbnail_url: uploaded.thumbnailUrl ?? raw.thumbnail_url,
+          metadata_synced_at: nowIso(),
+          status: "ready",
+          updated_at: nowIso(),
+        })
+        .eq("id", raw.id);
+      if (updateError) throw mapPostgrestError(updateError);
+
+      await recordVideoAccess(raw.id, userId, {
         action: "migrate",
         success: true,
         metadata: { from: "mux", to: "google_drive" },
       });
-      mutate((db) => {
-        const record = db.video_migration_jobs.find((item) => item.id === jobId);
-        if (record) record.processed_videos += 1;
-      });
+      processed += 1;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      mutate((db) => {
-        const record = db.video_migration_jobs.find((item) => item.id === jobId);
-        if (record) {
-          record.failed_videos += 1;
-          record.errors.push({ video_id: video.id, message });
-        }
+      failed += 1;
+      errors.push({
+        video_id: raw.id,
+        message: error instanceof Error ? error.message : String(error),
       });
     }
   }
 
-  return mutate((db) => {
-    const record = db.video_migration_jobs.find((item) => item.id === jobId);
-    if (!record) throw ApiError.notFound("Job de migração não encontrado");
-    record.status =
-      record.processed_videos + record.failed_videos >= record.total_videos
-        ? record.failed_videos === record.total_videos
-          ? "failed"
-          : "completed"
-        : "running";
-    record.updated_at = nowIso();
-    return { ...record };
-  });
+  const remaining = Math.max(
+    0,
+    job.total_videos - processed - failed,
+  );
+
+  const status: VideoMigrationJob["status"] =
+    remaining === 0
+      ? processed === 0 && failed > 0
+        ? "failed"
+        : "completed"
+      : "running";
+
+  const { data: updated, error: updateJobError } = await supabase
+    .from("video_migration_jobs")
+    .update({
+      status,
+      processed_videos: processed,
+      failed_videos: failed,
+      errors,
+      updated_at: nowIso(),
+    })
+    .eq("id", jobId)
+    .select("*")
+    .single();
+  if (updateJobError) throw mapPostgrestError(updateJobError);
+  return updated as VideoMigrationJob;
 }
 
-export function getMigrationJob(userId: string, jobId: string): VideoMigrationJob {
-  const job = getDb().video_migration_jobs.find((item) => item.id === jobId);
-  if (!job) throw ApiError.notFound("Job de migração não encontrado");
-  if (job.user_id !== userId) throw ApiError.forbidden("Acesso negado");
-  return { ...job };
+export async function getMigrationJob(
+  userId: string,
+  jobId: string,
+): Promise<VideoMigrationJob> {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("video_migration_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (error) throw mapPostgrestError(error);
+  if (!data) throw ApiError.notFound("Job de migração não encontrado");
+  return data as VideoMigrationJob;
 }
 
 export async function getDriveVideoListing(

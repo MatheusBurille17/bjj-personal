@@ -14,7 +14,7 @@ import { toApiError } from "@/lib/google-oauth-errors";
 export const runtime = "nodejs";
 
 async function prepare(request: Request) {
-  const limit = checkRateLimit(`drive-oauth-authorize:${getClientIp(request)}`);
+  const limit = await checkRateLimit(`drive-oauth-authorize:${getClientIp(request)}`);
   if (!limit.allowed) return { rateLimited: true as const, limit };
 
   enforceHttpsInProduction(request);

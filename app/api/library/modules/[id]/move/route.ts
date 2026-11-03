@@ -8,5 +8,5 @@ export const POST = route<{ id: string }>(async (request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
   const data = moveModuleSchema.parse(await parseJson(request));
-  return jsonSuccess(moveModule(id, session.user.id, data.technique_id));
+  return jsonSuccess(await moveModule(id, session.user.id, data.technique_id));
 });

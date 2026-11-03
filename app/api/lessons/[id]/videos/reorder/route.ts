@@ -8,5 +8,5 @@ export const PATCH = route<{ id: string }>(async (request, context) => {
   const session = await requireApiTeacher();
   const { id } = await context.params;
   const data = reorderSchema.parse(await parseJson(request));
-  return jsonSuccess(reorderLessonVideos(id, session.user.id, data.items));
+  return jsonSuccess(await reorderLessonVideos(id, session.user.id, data.items));
 });
