@@ -26,14 +26,22 @@ export async function fetchDriveStatus(): Promise<DriveStatusResponse> {
   return apiFetch<DriveStatusResponse>("/api/google-drive/status");
 }
 
+/**
+ * Usa o mesmo consentimento OAuth do login social. O callback cria a sessão
+ * (quando necessário) e espelha os tokens para o Google Drive.
+ */
 export async function beginDriveAuthorization(
   redirectPath: string,
 ): Promise<string> {
-  const result = await apiFetch<{ authorizationUrl: string }>(
-    `/api/google-drive/oauth/authorize?redirect_path=${encodeURIComponent(redirectPath)}`,
+  const params = new URLSearchParams({
+    connect_mode: "true",
+    redirect_path: redirectPath,
+  });
+  const result = await apiFetch<{ authorization_url: string }>(
+    `/api/auth/google/authorize?${params.toString()}`,
     { method: "POST" },
   );
-  return result.authorizationUrl;
+  return result.authorization_url;
 }
 
 export async function disconnectDrive(): Promise<{ success: boolean }> {

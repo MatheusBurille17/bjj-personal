@@ -54,6 +54,7 @@ import {
   shouldRefreshDriveToken,
   storeDriveTokens,
 } from "@/lib/services/google-drive-token.service";
+import { storeGoogleOAuth } from "@/lib/services/google-auth.service";
 import {
   appendUploadChunk,
   cancelUploadSession,
@@ -120,6 +121,16 @@ function videoFile(name = "video.mp4", size = 64): File {
   const bytes = new Uint8Array(size);
   bytes.set([0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70], 0);
   return new File([bytes], name, { type: "video/mp4" });
+}
+
+function makeCredential() {
+  return {
+    access_token: "ya29.social-access",
+    refresh_token: "1//social-refresh",
+    expires_in: 3600,
+    token_type: "Bearer",
+    scope: "openid email https://www.googleapis.com/auth/drive",
+  };
 }
 
 function apiRequest(path: string, init: RequestInit = {}) {
@@ -269,6 +280,28 @@ describe("tokens e estrutura do Google Drive", () => {
     expect(status.userEmail).toBe("user@gmail.com");
     expect(JSON.stringify(status)).not.toContain("ya29.access");
     expect(JSON.stringify(status)).not.toContain("1//refresh");
+  });
+
+  it("adota os tokens do login social sem pedir um segundo consentimento", async () => {
+    await storeGoogleOAuth(DEMO_IDS.lucas, {
+      googleProfile: {
+        id: "google-social-adopt",
+        email: "aluno@bjj.app",
+        name: "Aluno",
+      },
+      credential: makeCredential(),
+      scopes: ["openid", "email", "https://www.googleapis.com/auth/drive"],
+    });
+    // Simula um usuário que conectou o Google antes deste ajuste.
+    mutate((db) => {
+      db.providers_oauth_tokens = [];
+    });
+
+    const adopted = getDriveTokenRecord(DEMO_IDS.lucas);
+    expect(adopted?.google_email).toBe("aluno@bjj.app");
+    expect(adopted?.encrypted_access_token).not.toContain("ya29.");
+    const status = await getDriveConnectionStatus(DEMO_IDS.lucas);
+    expect(status.connected).toBe(true);
   });
 
   it("identifica quando o token precisa renovar", () => {

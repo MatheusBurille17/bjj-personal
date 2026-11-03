@@ -212,6 +212,11 @@ Drive, permissões nativas, modo híbrido, migração e tratamento de erros).
 - **Permissões:** além do compartilhamento nativo do Drive, a aplicação mantém a
   ACL existente de técnica/aula/plano antes de consultar o Drive, como defesa em
   profundidade (o design permite verificar RLS + Drive).
+- **Consentimento único:** login social e Drive compartilham o mesmo OAuth. Os
+  tokens são espelhados entre `user_google_oauth` e `providers_oauth_tokens`;
+  usuários antigos são adotados automaticamente, sem novo consentimento. A UI
+  tem apenas um botão “Conectar conta Google” e o card do Drive é informativo.
+  Os endpoints `/api/google-drive/oauth/*` permanecem como compatibilidade.
 - **Vídeos pessoais:** no runtime local os campos legados `teacher_id`,
   `module_id` e `technique_id` recebem o id do aluno/strings vazias para manter
   compatibilidade com o repositório JSON; a migração PostgreSQL permite `NULL`

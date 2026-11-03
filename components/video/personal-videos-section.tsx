@@ -18,17 +18,14 @@ import { apiFetch } from "@/lib/api/client";
 import type { Video } from "@/types/library";
 import { VideoPlayer } from "@/components/video/video-player";
 import { VideoUploadDialog } from "@/components/video/video-upload-dialog";
-import { GoogleDriveConnectButton } from "@/components/google-drive/google-drive-connect-button";
 
 export interface PersonalVideosSectionProps {
   driveConnected: boolean;
-  redirectPath?: string;
 }
 
 /** Área "Meus Vídeos Pessoais" do aluno. */
 export function PersonalVideosSection({
   driveConnected,
-  redirectPath = "/portal/profile",
 }: PersonalVideosSectionProps) {
   const router = useRouter();
   const [videos, setVideos] = React.useState<Video[]>([]);
@@ -86,12 +83,10 @@ export function PersonalVideosSection({
       </CardHeader>
       <CardContent className="space-y-3">
         {!driveConnected ? (
-          <div className="space-y-3">
-            <Alert variant="warning">
-              Conecte seu Google Drive para enviar e assistir vídeos pessoais.
-            </Alert>
-            <GoogleDriveConnectButton redirectPath={redirectPath} />
-          </div>
+          <Alert variant="warning">
+            Conecte sua conta Google na seção de conta acima para enviar e
+            assistir vídeos pessoais. O mesmo consentimento já autoriza o Drive.
+          </Alert>
         ) : loading ? (
           <div className="space-y-2">
             <Skeleton className="h-12 w-full" />

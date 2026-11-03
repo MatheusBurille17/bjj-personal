@@ -43,6 +43,11 @@ O modo **connect** exige sessão ativa e que o e-mail da conta Google seja igual
 ao e-mail da conta autenticada. Caso contrário a operação é rejeitada com
 `email_mismatch_on_connect`.
 
+O mesmo consentimento também autoriza o **Google Drive** para armazenamento de
+vídeos: os tokens são espelhados automaticamente para `providers_oauth_tokens`.
+Não existe um segundo botão/fluxo de autorização do Drive na interface; veja
+[`google-drive-video-storage.md`](google-drive-video-storage.md).
+
 Um usuário novo criado via Google recebe, por padrão, o papel de **professor**
 (mesmo fluxo da página de signup por e-mail), com perfil contendo nome e foto
 retornados pelo Google. Usuários existentes mantêm seus papéis atuais.
