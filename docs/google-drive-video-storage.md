@@ -118,7 +118,7 @@ Formato padrão: `{ data, error, meta }`.
 |---|---|---|
 | POST | `/api/videos/upload` | Legado: upload multipart (limitado a ~4,5 MB na Vercel) |
 | POST | `/api/videos/upload/initialize` | Cria a sessão resumable e devolve `upload_url` |
-| PUT | `upload_url` (Google) | O **navegador** envia o arquivo direto ao Drive |
+| PUT | `/api/videos/upload/:sessionId/chunk` | Proxy autenticado de um chunk (4 MB) para o Google |
 | POST | `/api/videos/upload/:sessionId/complete` | Valida o arquivo no Drive e cria o vídeo no Supabase |
 | POST | `/api/videos/upload/:sessionId/cancel` | Cancela a sessão |
 
@@ -230,12 +230,13 @@ mensagem amigável.
 - Listagem de pasta: cache por 5min.
 - Retry exponencial (base configurável) para 429/5xx/timeout, até 3 tentativas.
 - Circuit breaker abre após 5 falhas consecutivas e pausa por 5min.
-- Upload **resumable direto do navegador** para o Google Drive: o corpo não
-  passa pela Vercel e não sofre o limite de 4,5 MB por requisição. O servidor
-  apenas cria a sessão e finaliza o registro.
-- Progresso real via `XMLHttpRequest.upload.onprogress`; sem WebSocket.
-- Timeout de 30s para chamadas de metadados/API e 30min para upload server-side
-  (migração).
+- Upload **resumable em chunks de 4 MB**: o navegador envia cada chunk para
+  `/api/videos/upload/:sessionId/chunk`, que repassa ao Google Drive. O
+  navegador nunca fala com `googleapis.com` (evita o bloqueio de CORS do
+  endpoint de upload) e cada requisição fica abaixo do limite de 4,5 MB da
+  Vercel.
+- Progresso por chunk no cliente; sem WebSocket.
+- Timeout de 60s por chunk e 30min para upload server-side (migração).
 
 ---
 

@@ -104,7 +104,13 @@ export interface CompletedUploadResponse {
   status: string;
 }
 
-/** Cria a sessão resumable no Drive (o arquivo não passa pela Vercel). */
+interface UploadChunkResponse {
+  status: "partial" | "completed";
+  file_id?: string;
+  range?: string | null;
+}
+
+/** Cria a sessão resumable no Drive. */
 export async function createUploadSession(
   input: CreateUploadSessionInput,
 ): Promise<UploadSessionResponse> {
@@ -145,115 +151,11 @@ export async function cancelUploadSession(sessionId: string): Promise<void> {
 }
 
 /**
- * Envia o arquivo diretamente para a URL resumable do Google (CORS), em chunks
- * de 8 MiB com `Content-Range`. O corpo não passa pelas Functions da Vercel,
- * então não há limite de 4,5 MB.
- */
-export function uploadFileToDrive(
-  uploadUrl: string,
-  file: File,
-  onProgress: (progress: {
-    loaded: number;
-    total: number;
-    percentage: number;
-  }) => void,
-  mimeTypeOverride?: string,
-): UploadHandle {
-  const CHUNK_SIZE = 8 * 1024 * 1024;
-  const controller = new AbortController();
-  const mimeType = mimeTypeOverride || file.type || "application/octet-stream";
-
-  const promise = (async () => {
-    let offset = 0;
-    let fileId: string | null = null;
-
-    while (offset < file.size) {
-      const end = Math.min(offset + CHUNK_SIZE, file.size);
-      const chunk = file.slice(offset, end);
-      const isLast = end >= file.size;
-
-      let response: Response;
-      try {
-        response = await fetch(uploadUrl, {
-          method: "PUT",
-          headers: {
-            "Content-Type": mimeType,
-            "Content-Range": `bytes ${offset}-${end - 1}/${file.size}`,
-          },
-          body: chunk,
-          signal: controller.signal,
-        });
-      } catch {
-        if (controller.signal.aborted) {
-          throw new ApiClientError(0, {
-            code: "INTERNAL_ERROR",
-            message: "Upload cancelado",
-          });
-        }
-        throw new ApiClientError(0, {
-          code: "INTERNAL_ERROR",
-          message:
-            "Falha de rede ao enviar para o Google Drive. Verifique sua conexão.",
-        });
-      }
-
-      // 308 Resume Incomplete: o Google recebeu o chunk e espera o próximo.
-      if (response.status !== 308 && !response.ok) {
-        let message = "Não foi possível enviar o arquivo para o Google Drive.";
-        try {
-          const payload = (await response.json()) as {
-            error?: { message?: string };
-          };
-          if (payload?.error?.message) message = payload.error.message;
-        } catch {
-          // resposta sem JSON
-        }
-        throw new ApiClientError(response.status, {
-          code: response.status === 401 ? "UNAUTHORIZED" : "INTERNAL_ERROR",
-          message,
-        });
-      }
-
-      if (isLast && response.status !== 308) {
-        const payload = (await response.json().catch(() => null)) as
-          | { id?: string }
-          | null;
-        fileId = typeof payload?.id === "string" ? payload.id : null;
-      }
-
-      // O Google pode confirmar menos bytes do que enviamos; usa o Range.
-      if (response.status === 308) {
-        const range = response.headers.get("Range");
-        const match = range ? /bytes=(\d+)-(\d+)/.exec(range) : null;
-        offset = match ? Number(match[2]) + 1 : end;
-      } else {
-        offset = end;
-      }
-      onProgress({
-        loaded: offset,
-        total: file.size,
-        percentage: Math.min(100, Math.round((offset / file.size) * 100)),
-      });
-    }
-
-    if (!fileId) {
-      throw new ApiClientError(500, {
-        code: "INTERNAL_ERROR",
-        message: "O Google Drive não retornou o ID do arquivo enviado.",
-      });
-    }
-    return { fileId };
-  })();
-
-  return {
-    promise,
-    abort: () => controller.abort(),
-  };
-}
-
-/**
- * Fluxo completo: cria a sessão no servidor, envia o arquivo direto ao Drive e
- * finaliza criando o registro do vídeo no Supabase.
+ * Envia o arquivo em chunks de 4 MB para o proxy da própria aplicação.
+ *
+ * O Route Handler repassa cada chunk à sessão resumable do Google. O navegador
+ * nunca fala com `googleapis.com`, então não há bloqueio de CORS. Cada chunk
+ * fica abaixo do limite de 4,5 MB por requisição das Functions da Vercel.
  */
 export function uploadVideoResumable(
   input: CreateUploadSessionInput,
@@ -263,7 +165,7 @@ export function uploadVideoResumable(
     percentage: number;
   }) => void,
 ): UploadHandle {
-  let abortDrive: (() => void) | null = null;
+  const controller = new AbortController();
   let aborted = false;
 
   const promise = (async () => {
@@ -276,17 +178,94 @@ export function uploadVideoResumable(
       });
     }
 
-    const driveHandle = uploadFileToDrive(
-      session.upload_url,
-      input.file,
-      onProgress,
-      session.mime_type,
-    );
-    abortDrive = driveHandle.abort;
+    const chunkSize =
+      session.chunk_size > 0 ? session.chunk_size : 4 * 1024 * 1024;
+    let offset = 0;
+    let fileId: string | null = null;
 
     try {
-      const { fileId } = (await driveHandle.promise) as { fileId: string };
-      return await completeUploadSession(session.session_id, fileId, input.file.size);
+      while (offset < input.file.size) {
+        const end = Math.min(offset + chunkSize, input.file.size);
+        const chunk = input.file.slice(offset, end);
+
+        let response: Response;
+        try {
+          response = await fetch(
+            `/api/videos/upload/${encodeURIComponent(session.session_id)}/chunk`,
+            {
+              method: "PUT",
+              headers: {
+                "Content-Type": "application/octet-stream",
+                "Content-Range": `bytes ${offset}-${end - 1}/${input.file.size}`,
+              },
+              body: chunk,
+              signal: controller.signal,
+            },
+          );
+        } catch {
+          if (aborted) {
+            throw new ApiClientError(0, {
+              code: "INTERNAL_ERROR",
+              message: "Upload cancelado",
+            });
+          }
+          throw new ApiClientError(0, {
+            code: "INTERNAL_ERROR",
+            message:
+              "Falha de rede durante o upload. Verifique sua conexão e tente novamente.",
+          });
+        }
+
+        const payload = (await response.json().catch(() => null)) as
+          | { data?: UploadChunkResponse; error?: unknown }
+          | null;
+        if (!response.ok) {
+          const detail = payload?.error as
+            | { code?: string; message?: string }
+            | undefined;
+          throw new ApiClientError(response.status, {
+            code: (detail?.code as never) ?? "INTERNAL_ERROR",
+            message:
+              detail?.message ??
+              "Não foi possível enviar o arquivo para o Google Drive.",
+          });
+        }
+
+        const data = payload?.data ?? (payload as UploadChunkResponse | null);
+        if (data?.status === "completed" && data.file_id) {
+          fileId = data.file_id;
+        }
+
+        // O Google pode confirmar menos bytes do que enviamos; retoma do ponto
+        // informado no header Range.
+        if (data?.status === "partial" && data.range) {
+          const range = /bytes=(\d+)-(\d+)/.exec(data.range);
+          offset = range ? Number(range[2]) + 1 : end;
+        } else {
+          offset = end;
+        }
+        onProgress({
+          loaded: offset,
+          total: input.file.size,
+          percentage: Math.min(
+            100,
+            Math.round((offset / input.file.size) * 100),
+          ),
+        });
+      }
+
+      if (!fileId) {
+        throw new ApiClientError(500, {
+          code: "INTERNAL_ERROR",
+          message: "O Google Drive não retornou o ID do arquivo enviado.",
+        });
+      }
+
+      return await completeUploadSession(
+        session.session_id,
+        fileId,
+        input.file.size,
+      );
     } catch (error) {
       await cancelUploadSession(session.session_id).catch(() => undefined);
       throw error;
@@ -297,14 +276,14 @@ export function uploadVideoResumable(
     promise,
     abort: () => {
       aborted = true;
-      abortDrive?.();
+      controller.abort();
     },
   };
 }
 
 /**
- * Upload multipart com progresso real via XMLHttpRequest (fetch não expõe
- * progresso de upload em todos os navegadores).
+ * Legado: upload multipart em uma única requisição (limitado a ~4,5 MB na
+ * Vercel). A UI usa `uploadVideoResumable`.
  */
 export function uploadVideoWithProgress(
   form: FormData,

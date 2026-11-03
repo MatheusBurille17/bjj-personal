@@ -206,10 +206,11 @@ Drive, permissões nativas, modo híbrido, migração e tratamento de erros).
   preview do Drive. Assim a expiração é aplicada pelo servidor e nenhuma URL é
   persistida (Propriedade 16). O design citava cache de 30s; optamos por não
   cachear URLs por segurança.
-- **Upload:** o navegador usa a sessão resumable nativa do Google Drive em
-  chunks de 8 MiB (`Content-Range`); o corpo não passa pela Vercel, eliminando o
-  limite de 4,5 MB. O servidor apenas cria a sessão, valida o arquivo e grava os
-  metadados no Supabase.
+- **Upload:** o navegador envia chunks de 4 MB (`Content-Range`) para um Route
+  Handler da aplicação, que repassa à sessão resumable do Google Drive. Isso
+  evita o bloqueio de CORS do endpoint de upload do Google e mantém cada
+  requisição abaixo do limite de 4,5 MB da Vercel. O servidor valida o arquivo e
+  grava os metadados no Supabase.
 - **WebSocket:** o progresso é exposto por polling HTTP no componente de upload;
   WebSocket ficou como opcional não necessário no MVP.
 - **Migração Mux → Drive:** execução sob demanda em lotes (`POST

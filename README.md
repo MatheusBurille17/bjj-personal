@@ -153,8 +153,9 @@ supabase db push
 7. Para armazenamento de vídeos, adicione `GOOGLE_OAUTH_SCOPES` (padrão
    `openid email profile https://www.googleapis.com/auth/drive.file`),
    `PLAYBACK_TOKEN_SECRET` e, opcionalmente, os limites de retry. O upload é
-   resumable direto do navegador para o Drive (sem o limite de 4,5 MB da
-   Vercel). As rotas legadas do Drive (`NEXT_PUBLIC_GOOGLE_DRIVE_REDIRECT_URI`)
+   resumable em chunks de 4 MB via proxy da aplicação (abaixo do limite de
+   4,5 MB da Vercel e sem CORS do Google). As rotas legadas do Drive
+   (`NEXT_PUBLIC_GOOGLE_DRIVE_REDIRECT_URI`)
    só são necessárias se você usar `/api/google-drive/oauth/*` diretamente. Veja
    [`docs/google-drive-video-storage.md`](docs/google-drive-video-storage.md).
 8. Opcional: defina `UPSTASH_REDIS_REST_URL` e `UPSTASH_REDIS_REST_TOKEN` para

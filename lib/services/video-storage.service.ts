@@ -38,8 +38,11 @@ import { buildPlaybackUrl } from "./playback-token.service";
 
 // Uploads grandes podem levar mais de uma hora em conexões lentas.
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
-/** Tamanho de chunk usado pelo navegador (8 MiB). */
-const RESUMABLE_CHUNK_SIZE = 8 * 1024 * 1024;
+/**
+ * Tamanho de chunk do upload. Fica abaixo do limite de 4,5 MB por requisição
+ * das Functions da Vercel e é múltiplo de 256 KB (exigência do Google).
+ */
+const RESUMABLE_CHUNK_SIZE = 4 * 1024 * 1024;
 // Um vídeo por requisição mantém o download+upload dentro do tempo/memória da
 // Function. O cliente/script repete até o job concluir.
 const MIGRATION_BATCH_SIZE = 1;
@@ -971,6 +974,35 @@ export async function getUploadSession(
     throw new ApiError(410, "GONE", "Sessão de upload expirada");
   }
   return session;
+}
+
+/** Marca um chunk como recebido (progresso/resume). */
+export async function markUploadChunk(
+  userId: string,
+  sessionId: string,
+  chunkIndex: number,
+): Promise<void> {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("video_upload_sessions")
+    .select("received_chunks, status")
+    .eq("id", sessionId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (error) throw mapPostgrestError(error);
+  if (!data || data.status === "completed" || data.status === "cancelled") {
+    return;
+  }
+
+  const received = Array.from(
+    new Set([...(data.received_chunks ?? []), chunkIndex]),
+  ).sort((a, b) => a - b);
+
+  const { error: updateError } = await supabase
+    .from("video_upload_sessions")
+    .update({ received_chunks: received, status: "uploading" })
+    .eq("id", sessionId);
+  if (updateError) throw mapPostgrestError(updateError);
 }
 
 export interface CompleteUploadInput {
